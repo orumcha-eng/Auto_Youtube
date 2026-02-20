@@ -7,6 +7,7 @@ import json
 import time
 import re
 import subprocess
+import copy
 from datetime import datetime
 from dotenv import load_dotenv
 from src.visual_gen import VisualGenerator
@@ -21,8 +22,10 @@ load_dotenv()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(BASE_DIR, "out", "v3")
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
+PROJECTS_DIR = os.path.join(OUT_DIR, "projects")
 os.makedirs(OUT_DIR, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
+os.makedirs(PROJECTS_DIR, exist_ok=True)
 
 # ---- STYLE CONSTANTS ----
 BEAN_STYLE_PROMPT = "A white blob character, bean shape, tall, simple stick limbs, cute face, vector art, thick outlines, isolated on white"
@@ -47,6 +50,7 @@ if "v3_data" not in st.session_state:
     st.session_state.v3_data = {
         "step": 1, 
         "topic": "Global Economy",
+        "target_duration_min": 10,
         "thumbnail_data": None, # {image_path, title_text, full_prompt}
         "thumbnail_copy_options": {},
         "selected_thumbnail_copy": "",
@@ -76,6 +80,11 @@ def split_script_sentences(text: str) -> list:
     return out
 
 
+def auto_tts_style_instruction(text: str) -> str:
+    # User requested: disable dynamic style instruction to keep voice stable.
+    return ""
+
+
 def merge_mp3_files(input_files: list, out_path: str) -> str:
     files = [f for f in input_files if f and os.path.exists(f)]
     if not files:
@@ -96,6 +105,93 @@ def merge_mp3_files(input_files: list, out_path: str) -> str:
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_path
+
+
+def _serialize_v3_data(v3: dict) -> dict:
+    return copy.deepcopy(v3 or {})
+
+
+def _save_project_snapshot(v3: dict, label: str = "manual") -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(PROJECTS_DIR, f"project_{label}_{ts}.json")
+    payload = {
+        "saved_at": datetime.now().isoformat(),
+        "v3_data": _serialize_v3_data(v3),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def _list_project_snapshots() -> list:
+    files = [os.path.join(PROJECTS_DIR, x) for x in os.listdir(PROJECTS_DIR) if x.lower().endswith(".json")]
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files
+
+
+def _load_project_snapshot(path: str) -> bool:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        data = payload.get("v3_data")
+        if not isinstance(data, dict):
+            return False
+        st.session_state.v3_data = data
+        return True
+    except Exception:
+        return False
+
+
+def _recover_latest_outputs_best_effort() -> dict:
+    out = {
+        "step": 5,
+        "topic": "Recovered Session",
+        "target_duration_min": 10,
+        "thumbnail_data": None,
+        "thumbnail_copy_options": {},
+        "selected_thumbnail_copy": "",
+        "script_data": None,
+        "scenes": [],
+        "audio_segments": [],
+        "audio_path": None,
+        "video_path": None,
+    }
+    # Latest final video/audio
+    vids = [os.path.join(OUT_DIR, x) for x in os.listdir(OUT_DIR) if x.lower().endswith(".mp4")]
+    vids.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    if vids:
+        out["video_path"] = vids[0]
+
+    auds = [os.path.join(OUT_DIR, x) for x in os.listdir(OUT_DIR) if x.lower().endswith(".mp3")]
+    auds.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    if auds:
+        out["audio_path"] = auds[0]
+
+    # Recover scenes from generated scene images/videos
+    scene_imgs = [os.path.join(OUT_DIR, x) for x in os.listdir(OUT_DIR) if x.startswith("scene_") and x.lower().endswith(".png")]
+    scene_vids = [os.path.join(OUT_DIR, x) for x in os.listdir(OUT_DIR) if x.startswith("scene_vid_") and x.lower().endswith(".mp4")]
+    scene_imgs.sort(key=lambda p: os.path.getmtime(p))
+    scene_vids.sort(key=lambda p: os.path.getmtime(p))
+    max_n = max(len(scene_imgs), len(scene_vids))
+    for i in range(max_n):
+        img = scene_imgs[i] if i < len(scene_imgs) else None
+        vid = scene_vids[i] if i < len(scene_vids) else None
+        media = vid or img
+        if not media:
+            continue
+        out["scenes"].append({
+            "text": f"Recovered scene {i+1}",
+            "image_prompt": "",
+            "video_prompt": "",
+            "image_path": img,
+            "video_path": vid,
+            "generated_media_path": media,
+            "media_type": "video" if vid else "image",
+        })
+
+    # Do not recover script text from SRT because encoding-corrupted SRT can pollute script with gibberish.
+    out["script_data"] = {"full_text": "Recovered session. Please regenerate/refine script in Step 2.", "segments": []}
+    return out
 
 
 def fmt_mmss(sec: float) -> str:
@@ -214,7 +310,31 @@ def build_publish_package(v3: dict) -> dict:
 # ---- UI: SIDEBAR ----
 st.sidebar.title("Bean World Studio")
 api_key = st.sidebar.text_input("Gemini API Key", value=os.getenv("GOOGLE_API_KEY", ""), type="password")
+api_key_backup = st.sidebar.text_input("Gemini API Key (Backup, Optional)", value=os.getenv("GOOGLE_API_KEY_2", ""), type="password")
 st.session_state["luma_key_input"] = st.sidebar.text_input("Luma API Key (Optional for Real Video)", value=os.getenv("LUMA_API_KEY", ""), type="password")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Project State")
+if st.sidebar.button("Save Snapshot", use_container_width=True):
+    p = _save_project_snapshot(st.session_state.v3_data, label="manual")
+    st.sidebar.success(f"Saved: {os.path.basename(p)}")
+
+if st.sidebar.button("Load Latest Snapshot", use_container_width=True):
+    snaps = _list_project_snapshots()
+    if not snaps:
+        st.sidebar.warning("No snapshots found.")
+    else:
+        ok = _load_project_snapshot(snaps[0])
+        if ok:
+            st.sidebar.success(f"Loaded: {os.path.basename(snaps[0])}")
+            st.rerun()
+        else:
+            st.sidebar.error("Failed to load latest snapshot.")
+
+if st.sidebar.button("Recover Latest Outputs (Best Effort)", use_container_width=True):
+    st.session_state.v3_data = _recover_latest_outputs_best_effort()
+    st.sidebar.success("Recovered from latest outputs.")
+    st.rerun()
 
 # Sidebar bookmark navigation
 st.sidebar.markdown("---")
@@ -272,7 +392,7 @@ def step_thumbnail():
     
     # Helper: generation logic (Clean Image Only)
     def run_clean_gen(sel_obj, prompt_text: str):
-        vg = VisualGenerator(api_key)
+        vg = VisualGenerator(api_key, backup_api_key=api_key_backup)
         path = os.path.join(OUT_DIR, f"thumb_{int(time.time())}.png")
         with st.spinner("Rendering Base Thumbnail..."):
             res = vg.generate_image(prompt_text, path)
@@ -532,6 +652,7 @@ def step_script():
     length_map = {"Standard (10m)": 10, "Deep Dive (20m)": 20, "Marathon (30m)": 30}
     length_opt = st.select_slider("Target Duration", options=list(length_map.keys()))
     duration_val = length_map[length_opt]
+    st.session_state.v3_data["target_duration_min"] = duration_val
     
     if st.button("Generate Full Script" if not st.session_state.v3_data.get("script_data") else "Regenerate Script (Overwrite)"):
         if not api_key:
@@ -558,6 +679,14 @@ def step_script():
                     st.warning(f"Script is shorter than target for {duration_val} min. (current: {wc}, target min: {min_wc})")
 
     if st.session_state.v3_data["script_data"]:
+        cur_text = (st.session_state.v3_data["script_data"].get("full_text") or "")
+        cur_wc = len(cur_text.split())
+        est_min = cur_wc / 130.0 if cur_wc > 0 else 0.0
+        st.caption(
+            f"Script length: {cur_wc} words | Estimated narration: {est_min:.1f} min "
+            f"(target: {duration_val} min)"
+        )
+
         # Show Segments
         tabs = st.tabs(["Full Text"] + [s.get("title", f"Seg {i}") for i, s in enumerate(st.session_state.v3_data["script_data"].get("segments", []))])
         
@@ -579,6 +708,14 @@ def step_script():
             pass # Placeholder if we needed specific alignment
         with c2: 
             if st.button("Recalculate Scenes & Go Next"): 
+                min_wc = max(600, int(duration_val * 115))
+                wc_now = len((st.session_state.v3_data["script_data"].get("full_text") or "").split())
+                if wc_now < min_wc:
+                    st.error(
+                        f"Script too short for {duration_val}m target. "
+                        f"Current {wc_now} words, minimum {min_wc}. Regenerate or expand first."
+                    )
+                    return
                 next_step()
                 st.rerun()
 
@@ -606,7 +743,7 @@ def step_storyboard():
                 st.error("API Key required.")
             else:
                 with st.spinner("Director AI is planning shots..."):
-                    vg = VisualGenerator(api_key)
+                    vg = VisualGenerator(api_key, backup_api_key=api_key_backup)
                     full_script = st.session_state.v3_data["script_data"]["full_text"]
                     scenes = vg.analyze_script(full_script, BEAN_STYLE_PROMPT)
                     if scenes:
@@ -634,7 +771,7 @@ def step_storyboard():
                 st.rerun()
 
         if st.button("Generate ALL Missing Images", type="primary"):
-            vg = VisualGenerator(api_key)
+            vg = VisualGenerator(api_key, backup_api_key=api_key_backup)
             progress_bar = st.progress(0)
             targets = [i for i, s in enumerate(scenes) if not s.get("image_path") or not os.path.exists(s["image_path"])]
             if not targets:
@@ -697,7 +834,7 @@ def step_storyboard():
 
                 with c_btn:
                     if st.button(f"Generate Image {i+1}", key=f"btn_gen_{i}"):
-                        vg = VisualGenerator(api_key)
+                        vg = VisualGenerator(api_key, backup_api_key=api_key_backup)
                         fname = f"scene_{int(time.time())}_{i}.png"
                         out_path = os.path.join(OUT_DIR, fname)
                         with st.spinner("Drawing..."):
@@ -718,7 +855,7 @@ def step_storyboard():
                         if not current_img or not os.path.exists(current_img):
                             st.error("Generate image first.")
                         else:
-                            vg = VisualGenerator(api_key)
+                            vg = VisualGenerator(api_key, backup_api_key=api_key_backup)
                             fname = f"scene_vid_{int(time.time())}_{i}.mp4"
                             out_path = os.path.join(OUT_DIR, fname)
                             veo_success = False
@@ -809,7 +946,7 @@ def step_audio():
         help="AI Studio uses Gemini TTS voice set. Cloud uses ko-KR-Neural2/Studio voices."
     )
     tts_provider = "aistudio" if provider_label.startswith("AI Studio") else "cloud"
-    ag = AudioGenerator(api_key=api_key, provider=tts_provider)
+    ag = AudioGenerator(api_key=api_key, provider=tts_provider, backup_api_key=api_key_backup)
     recommended_voice = "Kore" if tts_provider == "aistudio" else "ko-KR-Neural2-C"
 
     voice_cache_key = f"voice_list_{tts_provider}"
@@ -824,6 +961,11 @@ def step_audio():
             st.success(f"Loaded {len(voices)} voices")
     with c2:
         speed = st.slider("Speed", 0.85, 1.20, 1.00, 0.01)
+        strict_voice = st.checkbox(
+            "Keep one voice only (disable fallback)",
+            value=True,
+            help="If checked, AI Studio failure does NOT fallback to Cloud. This prevents voice mixing."
+        )
 
     voices = st.session_state.v3_data.get(voice_cache_key) or []
     if voices:
@@ -855,6 +997,7 @@ def step_audio():
                 "tts_provider_used": None,
                 "tts_voice_used": None,
                 "tts_voice_gender": None,
+                "tts_style_used": None,
                 "tts_error": None,
             })
         st.session_state.v3_data["audio_segments"] = segs
@@ -862,26 +1005,54 @@ def step_audio():
 
     segs = st.session_state.v3_data.get("audio_segments") or []
     if segs:
+        # Detect likely mojibake/gibberish before costly TTS batch runs.
+        bad_like = 0
+        for s in segs[: min(30, len(segs))]:
+            t = (s.get("text") or "")
+            if not t:
+                continue
+            q_ratio = t.count("?") / max(1, len(t))
+            if q_ratio > 0.2 or "�" in t:
+                bad_like += 1
+        if bad_like >= 3:
+            st.error("Current script/segments look encoding-corrupted (many ?/�). Regenerate script in Step 2 before TTS.")
+
         failed_count = len([s for s in segs if s.get("tts_status") == "failed"])
         ready_count = len([s for s in segs if s.get("audio_path") and os.path.exists(s.get("audio_path"))])
         st.caption(f"Ready: {ready_count} | Failed: {failed_count} | Total: {len(segs)}")
+        min_interval_sec = 6.2 if tts_provider == "aistudio" else 0.0
 
         if st.button("Generate ALL Missing Sentence Audio", type="primary"):
             pb = st.progress(0)
             done = 0
             mixed_count = 0
+            last_req_at = 0.0
             for i, seg in enumerate(segs):
                 if seg.get("audio_path") and os.path.exists(seg["audio_path"]):
                     done += 1
                     pb.progress(done / len(segs))
                     continue
+                if min_interval_sec > 0 and last_req_at > 0:
+                    gap = time.time() - last_req_at
+                    if gap < min_interval_sec:
+                        time.sleep(min_interval_sec - gap)
                 out_p = os.path.join(OUT_DIR, f"tts_seg_{i:04d}_{int(time.time())}.mp3")
-                res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
+                style_instr = auto_tts_style_instruction(seg["text"])
+                res = ag.generate(
+                    seg["text"],
+                    voice_name,
+                    out_p,
+                    speed=speed,
+                    style_instruction=style_instr,
+                    allow_fallback=not strict_voice,
+                )
+                last_req_at = time.time()
                 if res and os.path.exists(res):
                     seg["audio_path"] = res
                     seg["tts_provider_used"] = ag.last_provider_used
                     seg["tts_voice_used"] = voice_name
                     seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                    seg["tts_style_used"] = style_instr
                     seg["tts_status"] = "ok"
                     seg["tts_error"] = None
                     if tts_provider == "aistudio" and ag.last_provider_used != "aistudio":
@@ -891,6 +1062,7 @@ def step_audio():
                     seg["tts_provider_used"] = ag.last_provider_used
                     seg["tts_voice_used"] = voice_name
                     seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                    seg["tts_style_used"] = style_instr
                     seg["tts_error"] = ag.last_error or "unknown_error"
                 done += 1
                 pb.progress(done / len(segs))
@@ -907,21 +1079,37 @@ def step_audio():
                 st.info("No failed segments.")
             else:
                 pb = st.progress(0)
+                last_req_at = 0.0
                 for i, seg in enumerate(failed):
+                    if min_interval_sec > 0 and last_req_at > 0:
+                        gap = time.time() - last_req_at
+                        if gap < min_interval_sec:
+                            time.sleep(min_interval_sec - gap)
                     out_p = os.path.join(OUT_DIR, f"tts_seg_{seg['idx']:04d}_{int(time.time())}.mp3")
-                    res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
+                    style_instr = auto_tts_style_instruction(seg["text"])
+                    res = ag.generate(
+                        seg["text"],
+                        voice_name,
+                        out_p,
+                        speed=speed,
+                        style_instruction=style_instr,
+                        allow_fallback=not strict_voice,
+                    )
+                    last_req_at = time.time()
                     if res and os.path.exists(res):
                         seg["audio_path"] = res
                         seg["tts_status"] = "ok"
                         seg["tts_provider_used"] = ag.last_provider_used
                         seg["tts_voice_used"] = voice_name
                         seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_style_used"] = style_instr
                         seg["tts_error"] = None
                     else:
                         seg["tts_status"] = "failed"
                         seg["tts_provider_used"] = ag.last_provider_used
                         seg["tts_voice_used"] = voice_name
                         seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_style_used"] = style_instr
                         seg["tts_error"] = ag.last_error or "unknown_error"
                     pb.progress((i + 1) / len(failed))
                 st.success("Retry complete.")
@@ -931,13 +1119,24 @@ def step_audio():
             with st.expander(f"Seg {seg['idx']+1}: {seg['text'][:60]}..."):
                 st.write(seg["text"])
                 if st.button(f"Generate Seg {seg['idx']+1}", key=f"gen_seg_{seg['idx']}"):
+                    if min_interval_sec > 0:
+                        time.sleep(min_interval_sec)
                     out_p = os.path.join(OUT_DIR, f"tts_seg_{seg['idx']:04d}_{int(time.time())}.mp3")
-                    res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
+                    style_instr = auto_tts_style_instruction(seg["text"])
+                    res = ag.generate(
+                        seg["text"],
+                        voice_name,
+                        out_p,
+                        speed=speed,
+                        style_instruction=style_instr,
+                        allow_fallback=not strict_voice,
+                    )
                     if res and os.path.exists(res):
                         seg["audio_path"] = res
                         seg["tts_provider_used"] = ag.last_provider_used
                         seg["tts_voice_used"] = voice_name
                         seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_style_used"] = style_instr
                         seg["tts_status"] = "ok"
                         seg["tts_error"] = None
                         if tts_provider == "aistudio" and ag.last_provider_used != "aistudio":
@@ -950,6 +1149,7 @@ def step_audio():
                         seg["tts_provider_used"] = ag.last_provider_used
                         seg["tts_voice_used"] = voice_name
                         seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_style_used"] = style_instr
                         seg["tts_error"] = ag.last_error or "unknown_error"
                         st.error(f"TTS failed: {seg['tts_error']}")
                     st.rerun()
@@ -959,6 +1159,8 @@ def step_audio():
                     st.caption(f"Provider used: {seg.get('tts_provider_used')}")
                 if seg.get("tts_voice_used") or seg.get("tts_voice_gender"):
                     st.caption(f"Voice used: {seg.get('tts_voice_used')} | Gender: {seg.get('tts_voice_gender')}")
+                if seg.get("tts_style_used"):
+                    st.caption(f"Style used: {seg.get('tts_style_used')}")
                 if seg.get("tts_status") == "failed":
                     st.error(f"Status: failed | reason: {seg.get('tts_error') or 'unknown_error'}")
 
@@ -981,6 +1183,15 @@ def step_audio():
     if st.session_state.v3_data.get("audio_path") and os.path.exists(st.session_state.v3_data["audio_path"]):
         st.subheader("Final Audio")
         st.audio(st.session_state.v3_data["audio_path"])
+        aud_d = get_audio_duration(st.session_state.v3_data["audio_path"])
+        tgt = int(st.session_state.v3_data.get("target_duration_min") or 0)
+        if tgt > 0:
+            st.caption(f"Merged audio length: {aud_d/60:.2f} min (target: {tgt} min)")
+            if aud_d < (tgt * 60 * 0.85):
+                st.warning(
+                    "Merged audio is much shorter than target duration. "
+                    "Please regenerate/expand script or fill missing TTS before rendering."
+                )
 
     st.markdown("---")
     n1, n2 = st.columns(2)
@@ -1012,6 +1223,19 @@ def step_render():
             st.session_state.v3_data["step"] = 4
             st.rerun()
         return
+    target_min = int(st.session_state.v3_data.get("target_duration_min") or 0)
+    audio_dur = get_audio_duration(audio_path)
+    if target_min > 0:
+        st.caption(f"Audio length: {audio_dur/60:.2f} min (target: {target_min} min)")
+        if audio_dur < (target_min * 60 * 0.85):
+            st.error(
+                "Current merged audio is too short for selected target duration. "
+                "Go back to Step 4 and regenerate TTS/script, then merge again."
+            )
+            if st.button("Back to Audio to Fix Duration"):
+                st.session_state.v3_data["step"] = 4
+                st.rerun()
+            return
 
     # Longform mode: do not use old frame template layers.
     overlay_png = None
@@ -1026,17 +1250,31 @@ def step_render():
     image_zoom_max = st.slider("Image Motion Zoom Max", 1.02, 1.20, 1.10, 0.01)
     st.caption("Longform mode (16:9): no template frame / no overlay / no fixed character")
 
-    # Ensure media path fallback per scene.
+    # Keep scene count/order fixed to avoid AV timing drift.
+    # Missing media is replaced with nearest valid media or placeholder instead of skipping.
     render_scenes = []
+    last_valid_media = None
+    missing_count = 0
+    placeholder_path = os.path.join(ASSETS_DIR, "placeholder.jpg")
     for s in scenes:
         s2 = dict(s)
-        s2["generated_media_path"] = s2.get("generated_media_path") or s2.get("video_path") or s2.get("image_path")
-        if not s2.get("generated_media_path") or not os.path.exists(s2["generated_media_path"]):
-            # Skip impossible scenes at render-time with a warning.
-            continue
+        media_p = s2.get("generated_media_path") or s2.get("video_path") or s2.get("image_path")
+        if media_p and os.path.exists(media_p):
+            s2["generated_media_path"] = media_p
+            last_valid_media = media_p
+        else:
+            missing_count += 1
+            fallback_p = last_valid_media if last_valid_media and os.path.exists(last_valid_media) else placeholder_path
+            s2["generated_media_path"] = fallback_p
+            if not (fallback_p.lower().endswith(".mp4") or fallback_p.lower().endswith(".mov")):
+                s2["media_type"] = "image"
         render_scenes.append(s2)
 
     st.caption(f"Renderable scenes: {len(render_scenes)} / {len(scenes)}")
+    if missing_count > 0:
+        st.warning(
+            f"{missing_count} scene(s) had missing media. Render keeps timeline using previous media/placeholder (no scene skip)."
+        )
 
     if st.button("Render Final Video", type="primary"):
         if not render_scenes:
@@ -1076,6 +1314,7 @@ def step_render():
                     status_slot.caption("Render Progress: 100% | Done")
                     st.session_state.v3_data["last_render_scenes"] = render_scenes
                     st.session_state.v3_data["video_path"] = final_path
+                    _save_project_snapshot(st.session_state.v3_data, label="post_render")
                     st.success(f"Render complete: {final_path}")
             except Exception as e:
                 st.error(f"Render failed: {e}")

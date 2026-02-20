@@ -278,9 +278,6 @@ def build_script(target: date, headlines: List[Headline], today_events: List[Eve
     lines.append("That's the setup. Trade safe.")
     return "\n".join(lines)
 
-
-import google.generativeai as genai
-
 def fetch_investing_rss() -> List[Headline]:
     """Fetch from Investing.com RSS feeds"""
     all_headlines = []

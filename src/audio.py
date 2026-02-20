@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import re
 import wave
+import time
 from google.cloud import texttospeech
 from google.oauth2 import service_account
 from google import genai
@@ -49,8 +50,14 @@ class AudioGenerator:
         "Vindemiatrix": "Female",
     }
 
-    def __init__(self, api_key: str = None, provider: str = "auto"):
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
+    def __init__(self, api_key: str = None, provider: str = "auto", backup_api_key: str = None):
+        primary_key = (api_key or os.getenv("GOOGLE_API_KEY", "") or "").strip()
+        backup_key = (backup_api_key or os.getenv("GOOGLE_API_KEY_2", "") or "").strip()
+        keys = [k for k in [primary_key, backup_key] if k]
+        # De-duplicate while preserving order.
+        self.api_keys = list(dict.fromkeys(keys))
+        self.ai_key_idx = 0
+        self.api_key = self.api_keys[0] if self.api_keys else ""
         self.provider = (provider or "auto").lower()
         self.cloud_client = None
         self.ai_client = None
@@ -72,6 +79,25 @@ class AudioGenerator:
 
         if self.provider == "cloud":
             self.cloud_client = self._init_cloud_client()
+
+    def _rotate_aistudio_key(self, reason_msg: str = "") -> bool:
+        if self.provider != "aistudio":
+            return False
+        if len(self.api_keys) <= 1:
+            return False
+        nxt = self.ai_key_idx + 1
+        while nxt < len(self.api_keys):
+            cand = self.api_keys[nxt]
+            try:
+                self.ai_client = genai.Client(api_key=cand)
+                self.ai_key_idx = nxt
+                self.api_key = cand
+                print(f"AI Studio key rotated to backup key index {self.ai_key_idx} due to: {reason_msg[:120]}")
+                return True
+            except Exception as e:
+                print(f"Backup AI Studio key init failed at index {nxt}: {e}")
+                nxt += 1
+        return False
 
     def _init_cloud_client(self):
         key_path = "gcp-tts-key.json"
@@ -128,13 +154,24 @@ class AudioGenerator:
                 return "Male"
         return "Unknown"
 
-    def generate(self, text: str, voice_name: str, out_path: str, speed: float = 1.0) -> str:
+    def generate(
+        self,
+        text: str,
+        voice_name: str,
+        out_path: str,
+        speed: float = 1.0,
+        style_instruction: str = "",
+        allow_fallback: bool = True,
+    ) -> str:
         self.last_error = ""
         if self.provider == "aistudio":
-            res = self._generate_aistudio(text, voice_name, out_path, speed)
+            res = self._generate_aistudio(text, voice_name, out_path, speed, style_instruction=style_instruction)
             if res:
-                self.last_provider_used = "aistudio"
+                self.last_provider_used = f"aistudio_k{self.ai_key_idx+1}"
                 return res
+            if not allow_fallback:
+                self.last_provider_used = "aistudio_failed"
+                return None
             # Fallback to Cloud TTS when AI Studio returns empty audio or errors.
             if self.cloud_client is None:
                 try:
@@ -231,62 +268,135 @@ class AudioGenerator:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return p.returncode == 0 and os.path.exists(mp3_path)
 
-    def _generate_aistudio(self, text: str, voice_name: str, out_path: str, speed: float = 1.0) -> str:
+    def _generate_aistudio(self, text: str, voice_name: str, out_path: str, speed: float = 1.0, style_instruction: str = "") -> str:
         if not self.ai_client:
             print("AI Studio client not initialized.")
             return None
-        try:
-            resp = self.ai_client.models.generate_content(
-                model=self.ai_tts_model,
-                contents=(text or "").strip(),
-                config=types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=types.SpeechConfig(
-                        voice_config=types.VoiceConfig(
-                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                                voice_name=voice_name or "Kore"
-                            )
-                        )
-                    ),
-                ),
-            )
 
-            mime, audio_bytes = self._extract_inline_audio(resp)
-            if not audio_bytes:
-                print("AI Studio TTS returned no audio bytes.")
-                self.last_error = "AI Studio returned empty audio bytes"
-                return None
+        def _retry_delay_from_error(msg: str) -> float:
+            m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", msg, flags=re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+            m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?([0-9]+)s", msg, flags=re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+            return 6.0
 
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            mime_l = (mime or "").lower()
-            if "mpeg" in mime_l or out_path.lower().endswith(".mp3"):
-                # If already mp3, write directly.
-                if "mpeg" in mime_l:
+        def _normalize_style(s: str) -> str:
+            s = (s or "").strip()
+            s = re.sub(r"\s+", " ", s)
+            s = s.replace("\"", "").replace("'", "")
+            if len(s) > 160:
+                s = s[:160].rstrip() + "."
+            return s
+
+        def _build_prompt_variants(transcript: str, style: str) -> list:
+            if style:
+                return [
+                    f"Generate speech only in Korean. Read this transcript in this style: {style}\nTranscript: \"{transcript}\"",
+                    f"In Korean, speak clearly and steadily like a financial news presenter.\nTranscript: \"{transcript}\"",
+                    f"In Korean, say exactly this transcript naturally.\nTranscript: \"{transcript}\"",
+                ]
+            return [
+                f"Generate speech only in Korean. Read this transcript naturally.\nTranscript: \"{transcript}\"",
+                f"In Korean, say exactly this transcript.\nTranscript: \"{transcript}\"",
+            ]
+
+        t = (text or "").strip()
+        if not t:
+            self.last_error = "empty_text"
+            return None
+
+        sys_instr = _normalize_style(style_instruction)
+        prompt_variants = _build_prompt_variants(t, sys_instr)
+        last_msg = "AI Studio returned empty audio bytes"
+
+        for idx, tts_prompt in enumerate(prompt_variants):
+            for attempt in range(2):
+                try:
+                    resp = self.ai_client.models.generate_content(
+                        model=self.ai_tts_model,
+                        contents=tts_prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["AUDIO"],
+                            speech_config=types.SpeechConfig(
+                                voice_config=types.VoiceConfig(
+                                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                        voice_name=voice_name or "Kore"
+                                    )
+                                )
+                            ),
+                        ),
+                    )
+
+                    mime, audio_bytes = self._extract_inline_audio(resp)
+                    if not audio_bytes:
+                        last_msg = "AI Studio returned empty audio bytes"
+                        if attempt == 0:
+                            time.sleep(0.8)
+                            continue
+                        break
+
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                    mime_l = (mime or "").lower()
+                    if "mpeg" in mime_l or out_path.lower().endswith(".mp3"):
+                        # If already mp3, write directly.
+                        if "mpeg" in mime_l:
+                            with open(out_path, "wb") as f:
+                                f.write(audio_bytes)
+                            return out_path
+                        # If mime is pcm/wav and target is mp3, convert.
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                            tmp_wav = tmp.name
+                        if "l16" in mime_l:
+                            m = re.search(r"rate=(\d+)", mime_l)
+                            rate = int(m.group(1)) if m else 24000
+                            self._pcm_l16_to_wav(audio_bytes, tmp_wav, sample_rate=rate, channels=1)
+                        else:
+                            with open(tmp_wav, "wb") as f:
+                                f.write(audio_bytes)
+                        ok = self._wav_to_mp3(tmp_wav, out_path)
+                        try:
+                            os.remove(tmp_wav)
+                        except Exception:
+                            pass
+                        return out_path if ok else None
+
                     with open(out_path, "wb") as f:
                         f.write(audio_bytes)
                     return out_path
-                # If mime is pcm/wav and target is mp3, convert.
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                    tmp_wav = tmp.name
-                if "l16" in mime_l:
-                    m = re.search(r"rate=(\d+)", mime_l)
-                    rate = int(m.group(1)) if m else 24000
-                    self._pcm_l16_to_wav(audio_bytes, tmp_wav, sample_rate=rate, channels=1)
-                else:
-                    with open(tmp_wav, "wb") as f:
-                        f.write(audio_bytes)
-                ok = self._wav_to_mp3(tmp_wav, out_path)
-                try:
-                    os.remove(tmp_wav)
-                except Exception:
-                    pass
-                return out_path if ok else None
-
-            with open(out_path, "wb") as f:
-                f.write(audio_bytes)
-            return out_path
-        except Exception as e:
-            print(f"AI Studio TTS Failed: {e}")
-            self.last_error = str(e)
-            return None
+                except Exception as e:
+                    msg = str(e)
+                    print(f"AI Studio TTS Failed: {msg}")
+                    last_msg = msg
+                    if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                        ml = msg.lower()
+                        is_daily_quota = (
+                            "per_day" in ml
+                            or "per model per day" in ml
+                            or "generaterequestsperday" in ml
+                            or "limit: 0" in ml
+                        )
+                        if self._rotate_aistudio_key(msg):
+                            # Retry immediately with backup key.
+                            continue
+                        if is_daily_quota:
+                            # Daily cap won't recover by waiting; fail fast.
+                            self.last_error = msg
+                            return None
+                        wait_s = _retry_delay_from_error(msg) + 0.5
+                        time.sleep(wait_s)
+                        continue
+                    if "INTERNAL" in msg or "500" in msg:
+                        if attempt == 0:
+                            time.sleep(0.9)
+                            continue
+                        break
+                    if "INVALID_ARGUMENT" in msg and "generate text" in msg.lower():
+                        break
+                    return None
+            if idx < len(prompt_variants) - 1:
+                time.sleep(0.3)
+        self.last_error = last_msg
+        return None
 

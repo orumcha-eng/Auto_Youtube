@@ -5,10 +5,10 @@ import json
 import re
 import typing
 import time
+import os
 from google import genai
 from google.genai import types
 from dataclasses import dataclass
-import os
 import base64
 
 @dataclass
@@ -20,10 +20,34 @@ class Scene:
     video_prompt: str = ""
 
 class VisualGenerator:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.client = genai.Client(api_key=api_key)
+    def __init__(self, api_key: str, backup_api_key: str = None):
+        primary_key = (api_key or os.getenv("GOOGLE_API_KEY", "") or "").strip()
+        backup_key = (backup_api_key or os.getenv("GOOGLE_API_KEY_2", "") or "").strip()
+        keys = [k for k in [primary_key, backup_key] if k]
+        self.api_keys = list(dict.fromkeys(keys))
+        self.api_key_idx = 0
+        self.api_key = self.api_keys[0] if self.api_keys else ""
+        self.client = genai.Client(api_key=self.api_key) if self.api_key else None
         self.model_name = "gemini-2.0-flash"
+        self.last_key_used = f"k{self.api_key_idx+1}"
+
+    def _rotate_api_key(self, reason_msg: str = "") -> bool:
+        if len(self.api_keys) <= 1:
+            return False
+        nxt = self.api_key_idx + 1
+        while nxt < len(self.api_keys):
+            cand = self.api_keys[nxt]
+            try:
+                self.client = genai.Client(api_key=cand)
+                self.api_key_idx = nxt
+                self.api_key = cand
+                self.last_key_used = f"k{self.api_key_idx+1}"
+                print(f"Visual key rotated to backup index {self.api_key_idx} due to: {reason_msg[:120]}")
+                return True
+            except Exception as e:
+                print(f"Backup visual key init failed at index {nxt}: {e}")
+                nxt += 1
+        return False
 
     def add_text_overlay(self, image_path: str, text: str, style: str = "Yellow Label"):
         """Adds text overlay to the existing image using PIL with specific styles."""
@@ -363,48 +387,69 @@ class VisualGenerator:
     def generate_image(self, prompt: str, out_path: str):
         """Generates an image with current google.genai models, then falls back."""
         print(f"Generating image: {prompt[:50]}...")
+        self.last_key_used = f"k{self.api_key_idx+1}"
 
         # 1) Gemini image-capable models via generate_content (returns inline image).
-        for model_id in [
-            "models/gemini-2.5-flash-image",
-            "models/gemini-2.0-flash-exp-image-generation",
-        ]:
-            try:
-                response = self.client.models.generate_content(
-                    model=model_id,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
-                )
-                parts = getattr(response, "parts", None) or []
-                for part in parts:
-                    inline = getattr(part, "inline_data", None)
-                    if inline and getattr(inline, "data", None):
-                        with open(out_path, "wb") as f:
-                            f.write(inline.data)
-                        return out_path
-            except Exception as e:
-                print(f"Gemini image gen failed ({model_id}): {e}")
+        if self.client:
+            for model_id in [
+                "models/gemini-2.5-flash-image",
+                "models/gemini-2.0-flash-exp-image-generation",
+            ]:
+                attempt = 0
+                while attempt < 2:
+                    try:
+                        response = self.client.models.generate_content(
+                            model=model_id,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
+                        )
+                        parts = getattr(response, "parts", None) or []
+                        for part in parts:
+                            inline = getattr(part, "inline_data", None)
+                            if inline and getattr(inline, "data", None):
+                                with open(out_path, "wb") as f:
+                                    f.write(inline.data)
+                                self.last_key_used = f"k{self.api_key_idx+1}"
+                                return out_path
+                        break
+                    except Exception as e:
+                        msg = str(e)
+                        print(f"Gemini image gen failed ({model_id}): {msg}")
+                        if ("429" in msg or "RESOURCE_EXHAUSTED" in msg) and self._rotate_api_key(msg):
+                            attempt += 1
+                            continue
+                        break
 
         # 2) Imagen fallback via generate_images.
-        for model_id in [
-            "models/imagen-4.0-fast-generate-001",
-            "models/imagen-4.0-generate-001",
-        ]:
-            try:
-                response = self.client.models.generate_images(
-                    model=model_id,
-                    prompt=prompt,
-                    config=types.GenerateImagesConfig(
-                        number_of_images=1,
-                        aspect_ratio="16:9",
-                    ),
-                )
-                if response.generated_images:
-                    image = response.generated_images[0].image
-                    image.save(out_path)
-                    return out_path
-            except Exception as e:
-                print(f"Imagen gen failed ({model_id}): {e}")
+        if self.client:
+            for model_id in [
+                "models/imagen-4.0-fast-generate-001",
+                "models/imagen-4.0-generate-001",
+            ]:
+                attempt = 0
+                while attempt < 2:
+                    try:
+                        response = self.client.models.generate_images(
+                            model=model_id,
+                            prompt=prompt,
+                            config=types.GenerateImagesConfig(
+                                number_of_images=1,
+                                aspect_ratio="16:9",
+                            ),
+                        )
+                        if response.generated_images:
+                            image = response.generated_images[0].image
+                            image.save(out_path)
+                            self.last_key_used = f"k{self.api_key_idx+1}"
+                            return out_path
+                        break
+                    except Exception as e:
+                        msg = str(e)
+                        print(f"Imagen gen failed ({model_id}): {msg}")
+                        if ("429" in msg or "RESOURCE_EXHAUSTED" in msg) and self._rotate_api_key(msg):
+                            attempt += 1
+                            continue
+                        break
 
         # 3) Pollinations as last resort.
         print("Falling back to Pollinations.ai...")
@@ -439,8 +484,10 @@ class VisualGenerator:
         try:
             import requests
 
-            client = genai.Client(api_key=self.api_key)
-            if not hasattr(client.models, "generate_videos"):
+            if not self.client:
+                print("Veo Gen Failed: no Gemini API key configured")
+                return None
+            if not hasattr(self.client.models, "generate_videos"):
                 print("Veo Gen Failed: SDK has no generate_videos")
                 return None
 
@@ -452,7 +499,7 @@ class VisualGenerator:
             ]
             available = []
             try:
-                for m in client.models.list():
+                for m in self.client.models.list():
                     n = getattr(m, "name", "")
                     if n and "veo" in n.lower():
                         available.append(n)
@@ -464,23 +511,43 @@ class VisualGenerator:
             duration_sec = 5 if "veo-2.0" in model_id else 4
 
             ref_image = types.Image.from_file(location=image_path)
-            op = client.models.generate_videos(
-                model=model_id,
-                prompt=prompt,
-                image=ref_image,
-                config=types.GenerateVideosConfig(
-                    number_of_videos=1,
-                    aspect_ratio="16:9",
-                    duration_seconds=duration_sec,
-                ),
-            )
+            op = None
+            for _ in range(max(1, len(self.api_keys))):
+                try:
+                    op = self.client.models.generate_videos(
+                        model=model_id,
+                        prompt=prompt,
+                        image=ref_image,
+                        config=types.GenerateVideosConfig(
+                            number_of_videos=1,
+                            aspect_ratio="16:9",
+                            duration_seconds=duration_sec,
+                        ),
+                    )
+                    self.last_key_used = f"k{self.api_key_idx+1}"
+                    break
+                except Exception as e:
+                    msg = str(e)
+                    print(f"Veo submit failed: {msg}")
+                    if ("429" in msg or "RESOURCE_EXHAUSTED" in msg) and self._rotate_api_key(msg):
+                        continue
+                    return None
+            if op is None:
+                return None
 
             # Poll operation status.
             for _ in range(60):
                 time.sleep(3)
-                op = client.operations.get(op)
-                if op.done:
-                    break
+                try:
+                    op = self.client.operations.get(op)
+                    if op.done:
+                        break
+                except Exception as e:
+                    msg = str(e)
+                    if ("429" in msg or "RESOURCE_EXHAUSTED" in msg) and self._rotate_api_key(msg):
+                        continue
+                    print(f"Veo poll failed: {msg}")
+                    return None
 
             if not op.done:
                 print("Veo Gen Failed: operation timeout")

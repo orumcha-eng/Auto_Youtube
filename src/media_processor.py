@@ -161,25 +161,16 @@ def _compute_scene_durations_from_audio_segments(
 
     n = len(scenes)
     m = len(seg_durs)
-    # Scene boundaries based on scene text lengths.
-    weights = [max(1, len((s.get("text") or "").strip())) for s in scenes]
-    tw = sum(weights) or 1
-    bounds = [0.0]
-    acc = 0
-    for w in weights:
-        acc += w
-        bounds.append(acc / tw)
 
+    # Stable mapping: allocate subtitle/audio segments by index order.
+    # This avoids tiny flashes from text-length weighting and keeps pacing predictable.
     by_scene = [0.0] * n
     for i, d in enumerate(seg_durs):
-        frac = (i + 0.5) / m
-        si = 0
-        while si < n - 1 and frac >= bounds[si + 1]:
-            si += 1
+        si = min(n - 1, int(i * n / max(1, m)))
         by_scene[si] += d
 
-    # Ensure every scene gets non-zero time.
-    min_d = 0.25
+    # Ensure every scene gets visible non-zero time.
+    min_d = 0.8
     by_scene = [x if x > 0 else min_d for x in by_scene]
     sum_scene = sum(by_scene)
     target = total_audio_dur if total_audio_dur > 0 else sum(seg_durs)

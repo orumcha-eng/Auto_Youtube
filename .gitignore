@@ -1,0 +1,32 @@
+.env
+.env.*
+!.env.example
+
+# Credentials / secrets
+token.json
+client_secret.json
+gcp-tts-key.json
+*.pem
+*.key
+*.p12
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Outputs / media
+out/
+*.mp4
+*.mp3
+*.srt
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

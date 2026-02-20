@@ -523,9 +523,24 @@ Output JSON only:
         min_words = max(600, int(duration_min * 115))
         target_words = int(duration_min * 135)
 
+        def _enforce_host_name(text: str, host_name: str = "콩이") -> str:
+            s = text or ""
+            # Placeholder / template tokens -> fixed host name
+            s = re.sub(r"\[(?:유튜버\s*이름|채널명|진행자)\]", host_name, s)
+            s = re.sub(r"\{(?:유튜버\s*이름|채널명|진행자)\}", host_name, s)
+            s = re.sub(r"\b(?:유튜버\s*이름|채널명|진행자)\b", host_name, s)
+            # Legacy naming variants
+            s = s.replace("경제 유튜버 'Bean'", f"경제 유튜버 '{host_name}'")
+            s = s.replace("경제 유튜버 \"Bean\"", f"경제 유튜버 \"{host_name}\"")
+            s = s.replace("경제 유튜버 Bean", f"경제 유튜버 {host_name}")
+            s = s.replace("'Bean'입니다", f"'{host_name}'입니다")
+            s = s.replace("Bean입니다", f"{host_name}입니다")
+            return s
+
         prompt = f"""
 당신은 한국어 경제 유튜브 대본 작가다.
 목표: 약 {duration_min}분 분량의 고유지율(long-form) 내레이션 대본 작성.
+진행자 이름 고정: 반드시 "콩이"를 사용한다.
 
 분량 규칙:
 - 목표 단어수: 약 {target_words}
@@ -550,6 +565,7 @@ Output JSON only:
 - 자연스러운 한국어 구어체 (경제 유튜버 톤)
 - 강약이 있는 문장 길이 (짧은 문장 + 설명 문장 혼합)
 - 과도한 공포 조장 금지, 그러나 긴장감은 유지
+- 인트로 자기소개가 필요하면 "오늘 정보를 전달해줄 콩이입니다." 형태로 작성
 
 금지 규칙:
 - 마크다운/불릿/헤더 기호 금지
@@ -577,10 +593,13 @@ Output JSON only:
         def _normalize_result(obj: dict) -> dict:
             if not isinstance(obj, dict):
                 return {"full_text": "", "segments": []}
-            full_text = (obj.get("full_text") or "").strip()
+            full_text = _enforce_host_name((obj.get("full_text") or "").strip())
             segments = obj.get("segments")
             if not isinstance(segments, list):
                 segments = []
+            for seg in segments:
+                if isinstance(seg, dict) and "body" in seg:
+                    seg["body"] = _enforce_host_name(seg.get("body") or "")
             return {"full_text": full_text, "segments": segments}
 
         try:

@@ -23,6 +23,31 @@ class AudioGenerator:
         "Iapetus", "Laomedeia", "Leda", "Melpomene", "Nereid",
         "Orpheus", "Rasalgethi", "Schedar", "Sulafat", "Umbriel", "Vindemiatrix",
     ]
+    AI_STUDIO_VOICE_GENDER = {
+        # Heuristic labels for UI guidance only.
+        "Kore": "Female",
+        "Puck": "Male",
+        "Charon": "Male",
+        "Fenrir": "Male",
+        "Orus": "Male",
+        "Zephyr": "Female",
+        "Aoede": "Female",
+        "Autonoe": "Female",
+        "Callirrhoe": "Female",
+        "Despina": "Female",
+        "Erinome": "Female",
+        "Iapetus": "Male",
+        "Laomedeia": "Female",
+        "Leda": "Female",
+        "Melpomene": "Female",
+        "Nereid": "Female",
+        "Orpheus": "Male",
+        "Rasalgethi": "Male",
+        "Schedar": "Female",
+        "Sulafat": "Female",
+        "Umbriel": "Male",
+        "Vindemiatrix": "Female",
+    }
 
     def __init__(self, api_key: str = None, provider: str = "auto"):
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
@@ -31,6 +56,9 @@ class AudioGenerator:
         self.ai_client = None
         self.ai_tts_model = "models/gemini-2.5-flash-preview-tts"
         self.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        self.last_provider_used = self.provider
+        self.last_error = ""
+        self.voice_gender_map = {}
 
         if self.provider == "auto":
             self.provider = "aistudio" if self.api_key else "cloud"
@@ -54,6 +82,7 @@ class AudioGenerator:
 
     def list_voices(self, lang="ko-KR") -> list:
         if self.provider == "aistudio":
+            self.voice_gender_map = dict(self.AI_STUDIO_VOICE_GENDER)
             return self.AI_STUDIO_VOICES
 
         try:
@@ -61,6 +90,17 @@ class AudioGenerator:
             # Filter for Neural2 or Studio voices if possible, or just return all names
             # Sort to put Neural/Studio text at top if possible
             voices = sorted([v.name for v in resp.voices])
+            gmap = {}
+            for v in resp.voices:
+                g = str(getattr(v, "ssml_gender", "NEUTRAL")).upper()
+                if "FEMALE" in g:
+                    gg = "Female"
+                elif "MALE" in g:
+                    gg = "Male"
+                else:
+                    gg = "Neutral"
+                gmap[v.name] = gg
+            self.voice_gender_map = gmap
             # prioritize Neural2
             neural = [v for v in voices if "Neural2" in v]
             studio = [v for v in voices if "Studio" in v]
@@ -70,12 +110,30 @@ class AudioGenerator:
             return studio + neural + wavenet + standard
         except Exception as e:
             print(f"List Voices Failed: {e}")
+            self.last_error = str(e)
             return ["ko-KR-Neural2-C", "ko-KR-Neural2-A"] # Fallback
 
+    def get_voice_gender(self, voice_name: str) -> str:
+        if not voice_name:
+            return "Unknown"
+        if self.provider == "aistudio":
+            return self.AI_STUDIO_VOICE_GENDER.get(voice_name, "Unknown")
+        if voice_name in self.voice_gender_map:
+            return self.voice_gender_map[voice_name]
+        if self.provider == "cloud":
+            # Heuristic fallback for cloud custom names.
+            if "-A" in voice_name or "-C" in voice_name or "-E" in voice_name:
+                return "Female"
+            if "-B" in voice_name or "-D" in voice_name:
+                return "Male"
+        return "Unknown"
+
     def generate(self, text: str, voice_name: str, out_path: str, speed: float = 1.0) -> str:
+        self.last_error = ""
         if self.provider == "aistudio":
             res = self._generate_aistudio(text, voice_name, out_path, speed)
             if res:
+                self.last_provider_used = "aistudio"
                 return res
             # Fallback to Cloud TTS when AI Studio returns empty audio or errors.
             if self.cloud_client is None:
@@ -83,10 +141,15 @@ class AudioGenerator:
                     self.cloud_client = self._init_cloud_client()
                 except Exception as e:
                     print(f"Cloud fallback init failed: {e}")
+                    self.last_error = str(e)
                     return None
             cloud_voice = voice_name if "-" in (voice_name or "") else "ko-KR-Neural2-C"
-            return self._generate_cloud(text, cloud_voice, out_path, speed)
-        return self._generate_cloud(text, voice_name, out_path, speed)
+            r = self._generate_cloud(text, cloud_voice, out_path, speed)
+            self.last_provider_used = "cloud_fallback" if r else "aistudio_failed"
+            return r
+        r = self._generate_cloud(text, voice_name, out_path, speed)
+        self.last_provider_used = "cloud" if r else "cloud_failed"
+        return r
 
     def _generate_cloud(self, text: str, voice_name: str, out_path: str, speed: float = 1.0) -> str:
         # Input
@@ -121,6 +184,7 @@ class AudioGenerator:
             
         except Exception as e:
             print(f"Google TTS Failed: {e}")
+            self.last_error = str(e)
             return None
 
     def _extract_inline_audio(self, resp):
@@ -190,6 +254,7 @@ class AudioGenerator:
             mime, audio_bytes = self._extract_inline_audio(resp)
             if not audio_bytes:
                 print("AI Studio TTS returned no audio bytes.")
+                self.last_error = "AI Studio returned empty audio bytes"
                 return None
 
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -222,5 +287,6 @@ class AudioGenerator:
             return out_path
         except Exception as e:
             print(f"AI Studio TTS Failed: {e}")
+            self.last_error = str(e)
             return None
 

@@ -271,11 +271,30 @@ class VisualGenerator:
             return item
         return {}
 
+    def _sanitize_narration_for_visual(self, text: str) -> str:
+        """Remove quoted/dialogue-like literals so models don't draw words from script."""
+        s = (text or "").strip()
+        if not s:
+            return ""
+        # Remove quoted speech blocks.
+        s = re.sub(r"\"[^\"]+\"", " ", s)
+        s = re.sub(r"'[^']+'", " ", s)
+        s = re.sub(r"“[^”]+”", " ", s)
+        s = re.sub(r"‘[^’]+’", " ", s)
+        # Remove bracketed placeholders and common dialogue markers.
+        s = re.sub(r"\[[^\]]+\]", " ", s)
+        s = re.sub(r"\([^\)]+\)", " ", s)
+        s = re.sub(r"(라고|이라며|말했다|외쳤다|속삭였다)\s*", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        # Keep concise visual intent only.
+        words = s.split()
+        return " ".join(words[:18])
+
     def build_cinematic_video_prompt(self, scene: dict, character_desc: str = "", style_hint: str = "") -> str:
         """
         Build a richer I2V prompt so results are not just a character walking on plain background.
         """
-        narration = (scene.get("text") or "").strip()
+        narration = self._sanitize_narration_for_visual(scene.get("text") or "")
         image_prompt = (scene.get("image_prompt") or "").strip()
         user_video_prompt = (scene.get("video_prompt") or "").strip()
         char = (character_desc or "Bean character").strip()
@@ -283,7 +302,7 @@ class VisualGenerator:
         lines = [
             "Create a detailed cinematic macro-news scene with strong environmental storytelling.",
             f"Character: {char}.",
-            f"Narration context: {narration}",
+            f"Primary action to visualize: {narration}",
             f"Scene visual context: {image_prompt}",
             f"Extra motion direction: {user_video_prompt}",
             f"Style hint: {style_hint}" if style_hint else "",
@@ -299,6 +318,12 @@ class VisualGenerator:
             "- Dramatic key light, rim light, volumetric light, high contrast cinematic grade.",
             "Output constraints:",
             "- No text overlays, no logos, no watermark, no gibberish letters.",
+            "- Absolutely no readable text/letters/numbers on signs, screens, newspapers, UI panels, or labels.",
+            "- If text would appear, replace it with abstract blocks/shapes/light patterns.",
+            "- Do not render any literal words/sentences from narration in the frame.",
+            "- No spoken dialogue and no embedded voice-over audio track.",
+            "- Mouth movement is allowed, but never render literal dialogue text/letters from narration.",
+            "- Silent visual-only clip. Audio will be added later via external TTS.",
             "- Keep character identity consistent with reference image.",
         ]
         return "\n".join([ln for ln in lines if ln])
@@ -307,26 +332,30 @@ class VisualGenerator:
         """
         Build a richer image prompt so generated stills have narrative depth and non-empty backgrounds.
         """
-        narration = (scene.get("text") or "").strip()
+        narration = self._sanitize_narration_for_visual(scene.get("text") or "")
         base_visual = (scene.get("image_prompt") or "").strip()
         char = (character_desc or "Bean character").strip()
 
         lines = [
             "Create a high-detail cinematic still image for a macro-news YouTube scene.",
             f"Character: {char}.",
-            f"Narration context: {narration}",
+            f"Primary action to visualize: {narration}",
             f"Base visual idea: {base_visual}",
             f"Style hint: {style_hint}" if style_hint else "",
             "Composition requirements:",
             "- Foreground: character close enough to read emotion and gesture.",
             "- Midground: topic-relevant props (trading screens, charts, newspaper desk, oil barrel, factory floor, city traffic, currency objects).",
             "- Background: rich environment with depth, atmosphere, and perspective; never plain white or empty backdrop.",
+            "- Use one concrete action verb in the frame (pointing, running, collapsing, bracing, signaling, comparing).",
             "Art direction:",
             "- Dramatic but readable lighting, strong contrast, cinematic color grade.",
             "- Clear focal point, layered depth, realistic texture detail.",
             "- Dynamic storytelling frame (not static passport-photo framing).",
             "Constraints:",
             "- No text, no letters, no watermark, no logo.",
+            "- Absolutely no readable characters or numbers anywhere in the image (signs/screens/tickers/documents).",
+            "- If text-like artifacts appear, convert them to abstract visual patterns.",
+            "- Do not render any literal words/sentences from narration in the frame.",
             "- Keep character identity consistent and clean.",
         ]
         return "\n".join([ln for ln in lines if ln])

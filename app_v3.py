@@ -13,7 +13,7 @@ from src.visual_gen import VisualGenerator
 from PIL import Image, ImageDraw, ImageFont
 import imageio_ffmpeg
 from src.audio import AudioGenerator
-from src.media_processor import render_video
+from src.media_processor import render_video, get_audio_duration, compute_scene_durations_from_audio_segments
 
 # ---- CONFIG & SETUP ----
 st.set_page_config(layout="wide", page_title="Auto Youtube V3 (Bean World)")
@@ -97,6 +97,120 @@ def merge_mp3_files(input_files: list, out_path: str) -> str:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_path
 
+
+def fmt_mmss(sec: float) -> str:
+    s = max(0, int(round(sec)))
+    mm = s // 60
+    ss = s % 60
+    return f"{mm}:{ss:02d}"
+
+
+def build_timeline_items(v3: dict) -> list:
+    audio_segments = v3.get("audio_segments") or []
+    scenes = v3.get("last_render_scenes") or v3.get("scenes") or []
+    audio_path = v3.get("audio_path")
+
+    total_audio = get_audio_duration(audio_path) if (audio_path and os.path.exists(audio_path)) else 0.0
+    if total_audio <= 0:
+        total_audio = sum(
+            get_audio_duration(seg.get("audio_path"))
+            for seg in audio_segments
+            if seg.get("audio_path") and os.path.exists(seg.get("audio_path"))
+        )
+    if total_audio <= 0:
+        total_audio = 600.0
+
+    scene_durs = compute_scene_durations_from_audio_segments(scenes, audio_segments, total_audio)
+    if len(scene_durs) != len(scenes):
+        # fallback: even split
+        n = max(1, len(scenes))
+        scene_durs = [total_audio / n] * n
+
+    def _label_from_scene(sc: dict, idx: int) -> str:
+        txt = (sc.get("text") or "").strip()
+        if not txt:
+            return f"핵심 이슈 {idx+1}"
+        # Use first phrase to keep timeline readable.
+        parts = re.split(r"[.!?]|다\\.|요\\.", txt)
+        head = (parts[0] or txt).strip()
+        head = re.sub(r"\\s+", " ", head)
+        return head[:36] + ("..." if len(head) > 36 else "")
+
+    items = []
+    cur = 0.0
+    for i, sc in enumerate(scenes):
+        t = "0:00" if i == 0 else fmt_mmss(cur)
+        items.append((t, _label_from_scene(sc, i)))
+        cur += max(0.0, float(scene_durs[i]))
+
+    if not items:
+        items = [("0:00", "오프닝"), (fmt_mmss(total_audio * 0.33), "핵심 이슈"), (fmt_mmss(total_audio * 0.8), "마무리")]
+    return items[:12]
+
+
+def build_issue_summary(v3: dict) -> list:
+    script_data = v3.get("script_data") or {}
+    issues = []
+    for seg in script_data.get("segments", []):
+        title = (seg.get("title") or "").strip()
+        body = (seg.get("body") or "").strip()
+        if title and title not in ("오프닝 훅", "마무리"):
+            issues.append(title)
+        elif body:
+            sentence = re.split(r"(?<=[.!?])\\s+|(?<=다\\.)\\s+|(?<=요\\.)\\s+", body)[0].strip()
+            if sentence:
+                issues.append(sentence[:42] + ("..." if len(sentence) > 42 else ""))
+    if not issues:
+        for i, sc in enumerate(v3.get("last_render_scenes") or v3.get("scenes") or []):
+            txt = (sc.get("text") or "").strip()
+            if txt:
+                issues.append(txt[:42] + ("..." if len(txt) > 42 else ""))
+            if len(issues) >= 5:
+                break
+    # de-dup preserve order
+    out = []
+    seen = set()
+    for it in issues:
+        if it in seen:
+            continue
+        seen.add(it)
+        out.append(it)
+    return out[:5]
+
+
+def build_publish_package(v3: dict) -> dict:
+    topic = (v3.get("topic") or "오늘의 시장 브리핑").strip()
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    title = f"[{date_str}] {topic} | 콩이의 경제/시장 핵심 브리핑"
+
+    tags = [
+        "경제", "시장", "주식", "미국증시", "나스닥", "S&P500", "금리", "인플레이션",
+        "환율", "유가", "FOMC", "투자전략", "경제뉴스", "콩이", topic.replace(" ", "")
+    ]
+    tags = [t for t in tags if t]
+    seen = set()
+    uniq_tags = []
+    for t in tags:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq_tags.append(t)
+    tags_csv = ", ".join(uniq_tags[:15])
+
+    timeline = build_timeline_items(v3)
+    tl_lines = [f"{t} {h}" for t, h in timeline]
+    issues = build_issue_summary(v3)
+    issue_lines = "\n".join([f"- {x}" for x in issues]) if issues else "- 오늘 시장 핵심 이슈 요약"
+    desc = (
+        f"오늘 영상은 {topic}를 중심으로, 장 마감 후 꼭 확인해야 할 이슈만 압축 정리했습니다.\n"
+        f"숫자와 맥락 위주로 핵심 시나리오를 정리했으니 투자 판단 전에 체크해보세요.\n\n"
+        f"[오늘의 핵심 이슈]\n{issue_lines}\n\n"
+        f"[타임라인]\n" + "\n".join(tl_lines) + "\n\n"
+        f"[안내]\n본 영상은 투자 권유가 아닌 정보 제공 목적입니다."
+    )
+
+    return {"title": title, "tags_csv": tags_csv, "description": desc}
+
 # ---- UI: SIDEBAR ----
 st.sidebar.title("Bean World Studio")
 api_key = st.sidebar.text_input("Gemini API Key", value=os.getenv("GOOGLE_API_KEY", ""), type="password")
@@ -117,11 +231,13 @@ if st.sidebar.button("Step 4: Audio", use_container_width=True, type=("primary" 
     jump_to_step(4)
 if st.sidebar.button("Step 5: Render", use_container_width=True, type=("primary" if current_step == 5 else "secondary")):
     jump_to_step(5)
+if st.sidebar.button("Step 6: Publish Pack", use_container_width=True, type=("primary" if current_step == 6 else "secondary")):
+    jump_to_step(6)
 
 from src.content import ContentModule
 
 # Top bookmark bar
-top_nav = st.columns(5)
+top_nav = st.columns(6)
 if top_nav[0].button("1. Thumbnail", use_container_width=True, type=("primary" if current_step == 1 else "secondary")):
     jump_to_step(1)
 if top_nav[1].button("2. Script", use_container_width=True, type=("primary" if current_step == 2 else "secondary")):
@@ -132,6 +248,8 @@ if top_nav[3].button("4. Audio", use_container_width=True, type=("primary" if cu
     jump_to_step(4)
 if top_nav[4].button("5. Render", use_container_width=True, type=("primary" if current_step == 5 else "secondary")):
     jump_to_step(5)
+if top_nav[5].button("6. Publish", use_container_width=True, type=("primary" if current_step == 6 else "secondary")):
+    jump_to_step(6)
 st.caption(f"Bookmark Navigation | Current Step: {st.session_state.v3_data['step']}")
 
 # ---- STEP 1: TOPIC & THUMBNAIL ----
@@ -722,6 +840,8 @@ def step_audio():
         default_voice = recommended_voice
         voice_name = st.text_input("Voice", value=default_voice)
     st.caption(f"Recommended default for this channel: {recommended_voice}")
+    voice_gender = ag.get_voice_gender(voice_name)
+    st.caption(f"Selected voice gender: {voice_gender}")
 
     if st.button("Prepare Sentence Segments"):
         sents = split_script_sentences(full_text)
@@ -731,15 +851,25 @@ def step_audio():
                 "idx": i,
                 "text": s,
                 "audio_path": None,
+                "tts_status": "pending",
+                "tts_provider_used": None,
+                "tts_voice_used": None,
+                "tts_voice_gender": None,
+                "tts_error": None,
             })
         st.session_state.v3_data["audio_segments"] = segs
         st.success(f"Prepared {len(segs)} sentence segments.")
 
     segs = st.session_state.v3_data.get("audio_segments") or []
     if segs:
+        failed_count = len([s for s in segs if s.get("tts_status") == "failed"])
+        ready_count = len([s for s in segs if s.get("audio_path") and os.path.exists(s.get("audio_path"))])
+        st.caption(f"Ready: {ready_count} | Failed: {failed_count} | Total: {len(segs)}")
+
         if st.button("Generate ALL Missing Sentence Audio", type="primary"):
             pb = st.progress(0)
             done = 0
+            mixed_count = 0
             for i, seg in enumerate(segs):
                 if seg.get("audio_path") and os.path.exists(seg["audio_path"]):
                     done += 1
@@ -749,9 +879,52 @@ def step_audio():
                 res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
                 if res and os.path.exists(res):
                     seg["audio_path"] = res
+                    seg["tts_provider_used"] = ag.last_provider_used
+                    seg["tts_voice_used"] = voice_name
+                    seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                    seg["tts_status"] = "ok"
+                    seg["tts_error"] = None
+                    if tts_provider == "aistudio" and ag.last_provider_used != "aistudio":
+                        mixed_count += 1
+                else:
+                    seg["tts_status"] = "failed"
+                    seg["tts_provider_used"] = ag.last_provider_used
+                    seg["tts_voice_used"] = voice_name
+                    seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                    seg["tts_error"] = ag.last_error or "unknown_error"
                 done += 1
                 pb.progress(done / len(segs))
             st.success("Sentence TTS generation done.")
+            if mixed_count > 0:
+                st.warning(
+                    f"Voice source mixed detected: {mixed_count} segment(s) used fallback engine. "
+                    "Check each segment provider and regenerate if needed."
+                )
+
+        if st.button("Retry FAILED Segments with Current Provider"):
+            failed = [s for s in segs if s.get("tts_status") == "failed"]
+            if not failed:
+                st.info("No failed segments.")
+            else:
+                pb = st.progress(0)
+                for i, seg in enumerate(failed):
+                    out_p = os.path.join(OUT_DIR, f"tts_seg_{seg['idx']:04d}_{int(time.time())}.mp3")
+                    res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
+                    if res and os.path.exists(res):
+                        seg["audio_path"] = res
+                        seg["tts_status"] = "ok"
+                        seg["tts_provider_used"] = ag.last_provider_used
+                        seg["tts_voice_used"] = voice_name
+                        seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_error"] = None
+                    else:
+                        seg["tts_status"] = "failed"
+                        seg["tts_provider_used"] = ag.last_provider_used
+                        seg["tts_voice_used"] = voice_name
+                        seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_error"] = ag.last_error or "unknown_error"
+                    pb.progress((i + 1) / len(failed))
+                st.success("Retry complete.")
 
         st.caption(f"Segments: {len(segs)}")
         for seg in segs[:40]:
@@ -762,9 +935,32 @@ def step_audio():
                     res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
                     if res and os.path.exists(res):
                         seg["audio_path"] = res
-                        st.rerun()
+                        seg["tts_provider_used"] = ag.last_provider_used
+                        seg["tts_voice_used"] = voice_name
+                        seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_status"] = "ok"
+                        seg["tts_error"] = None
+                        if tts_provider == "aistudio" and ag.last_provider_used != "aistudio":
+                            st.warning(
+                                f"Seg {seg['idx']+1} used fallback provider: {ag.last_provider_used}. "
+                                "Voice may sound different."
+                            )
+                    else:
+                        seg["tts_status"] = "failed"
+                        seg["tts_provider_used"] = ag.last_provider_used
+                        seg["tts_voice_used"] = voice_name
+                        seg["tts_voice_gender"] = ag.get_voice_gender(voice_name)
+                        seg["tts_error"] = ag.last_error or "unknown_error"
+                        st.error(f"TTS failed: {seg['tts_error']}")
+                    st.rerun()
                 if seg.get("audio_path") and os.path.exists(seg["audio_path"]):
                     st.audio(seg["audio_path"])
+                if seg.get("tts_provider_used"):
+                    st.caption(f"Provider used: {seg.get('tts_provider_used')}")
+                if seg.get("tts_voice_used") or seg.get("tts_voice_gender"):
+                    st.caption(f"Voice used: {seg.get('tts_voice_used')} | Gender: {seg.get('tts_voice_gender')}")
+                if seg.get("tts_status") == "failed":
+                    st.error(f"Status: failed | reason: {seg.get('tts_error') or 'unknown_error'}")
 
         if len(segs) > 40:
             st.caption(f"... {len(segs)-40} more segments not expanded")
@@ -827,6 +1023,7 @@ def step_render():
     news_box = (0, 0, 1920, 1080)
     sub_margin_v = 60
     sub_font_size = 34
+    image_zoom_max = st.slider("Image Motion Zoom Max", 1.02, 1.20, 1.10, 0.01)
     st.caption("Longform mode (16:9): no template frame / no overlay / no fixed character")
 
     # Ensure media path fallback per scene.
@@ -846,6 +1043,12 @@ def step_render():
             st.error("No renderable scenes. Generate scene media first.")
         else:
             try:
+                progress_slot = st.progress(0.0)
+                status_slot = st.empty()
+                def _on_progress(v: float, msg: str):
+                    progress_slot.progress(v)
+                    status_slot.caption(f"Render Progress: {int(v * 100)}% | {msg}")
+
                 with st.spinner("Rendering final video... this can take several minutes."):
                     layout = {
                         "news_box": news_box,
@@ -855,6 +1058,8 @@ def step_render():
                         "subtitle_font_name": "Malgun Gothic Bold",
                         "subtitle_bold": 1,
                         "subtitle_max_chars": 20,
+                        "image_motion": "zoom_in_center",
+                        "image_zoom_max": image_zoom_max,
                         "subtitle_segments": st.session_state.v3_data.get("audio_segments", []),
                     }
                     final_path = render_video(
@@ -865,7 +1070,11 @@ def step_render():
                         layout_config=layout,
                         width=1920,
                         height=1080,
+                        progress_cb=_on_progress,
                     )
+                    progress_slot.progress(1.0)
+                    status_slot.caption("Render Progress: 100% | Done")
+                    st.session_state.v3_data["last_render_scenes"] = render_scenes
                     st.session_state.v3_data["video_path"] = final_path
                     st.success(f"Render complete: {final_path}")
             except Exception as e:
@@ -883,13 +1092,63 @@ def step_render():
             )
 
     st.markdown("---")
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     with b1:
         if st.button("Back to Audio"):
             prev_step()
             st.rerun()
     with b2:
+        if final_video and os.path.exists(final_video):
+            if st.button("Go to Publish Pack (Step 6)"):
+                st.session_state.v3_data["step"] = 6
+                st.rerun()
+    with b3:
         if st.button("Restart"):
+            st.session_state.v3_data["step"] = 1
+            st.rerun()
+
+
+# ---- STEP 6: PUBLISH PACKAGE ----
+def step_publish_pack():
+    st.header("Step 6: Publish Package")
+    final_video = st.session_state.v3_data.get("video_path")
+    if not final_video or not os.path.exists(final_video):
+        st.warning("Final video not found. Complete Step 5 render first.")
+        if st.button("Back to Render"):
+            st.session_state.v3_data["step"] = 5
+            st.rerun()
+        return
+
+    if st.button("Generate Title/Tags/Description", type="primary") or "publish_pack" not in st.session_state.v3_data:
+        st.session_state.v3_data["publish_pack"] = build_publish_package(st.session_state.v3_data)
+
+    pack = st.session_state.v3_data.get("publish_pack") or build_publish_package(st.session_state.v3_data)
+
+    st.subheader("1) Video Title")
+    title_txt = st.text_area("Copy Title", value=pack.get("title", ""), height=80)
+
+    st.subheader("2) Tags (Comma Separated, 10+)")
+    tags_txt = st.text_area("Copy Tags", value=pack.get("tags_csv", ""), height=90)
+    st.caption("예: 태그1, 태그2, 태그3 ... 형태로 바로 붙여넣기")
+
+    st.subheader("3) Description (with Timeline)")
+    desc_txt = st.text_area("Copy Description", value=pack.get("description", ""), height=260)
+
+    st.download_button(
+        "Download Publish Text (.txt)",
+        data=f"[TITLE]\\n{title_txt}\\n\\n[TAGS]\\n{tags_txt}\\n\\n[DESCRIPTION]\\n{desc_txt}\\n",
+        file_name=f"publish_pack_{int(time.time())}.txt",
+        mime="text/plain",
+    )
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Back to Render"):
+            st.session_state.v3_data["step"] = 5
+            st.rerun()
+    with c2:
+        if st.button("Restart Workflow"):
             st.session_state.v3_data["step"] = 1
             st.rerun()
 
@@ -906,6 +1165,8 @@ elif step == 4:
     step_audio()
 elif step == 5:
     step_render()
+elif step == 6:
+    step_publish_pack()
 else:
     st.write("Unknown step.")
     if st.button("Restart"):

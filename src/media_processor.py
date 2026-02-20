@@ -3,8 +3,8 @@
 
 import os
 import subprocess
-import json
 import re
+import tempfile
 from typing import List, Optional
 import imageio_ffmpeg
 from mutagen.mp3 import MP3
@@ -53,13 +53,87 @@ def create_srt(scenes: List[dict], total_audio_dur: float, out_path: str):
         f.write("\n".join(lines))
     return out_path
 
+
+def _split_caption_chunks(text: str, max_chars: int = 20) -> List[str]:
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if not s:
+        return []
+
+    words = s.split(" ")
+    chunks = []
+    cur = ""
+    for w in words:
+        if not cur:
+            if len(w) <= max_chars:
+                cur = w
+            else:
+                # Hard-cut very long tokens to keep single-line guarantee.
+                for i in range(0, len(w), max_chars):
+                    chunks.append(w[i : i + max_chars])
+                cur = ""
+            continue
+        cand = f"{cur} {w}"
+        if len(cand) <= max_chars:
+            cur = cand
+        else:
+            chunks.append(cur)
+            if len(w) <= max_chars:
+                cur = w
+            else:
+                for i in range(0, len(w), max_chars):
+                    chunks.append(w[i : i + max_chars])
+                cur = ""
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c]
+
+
+def create_srt_from_audio_segments(audio_segments: List[dict], out_path: str, max_chars: int = 20) -> str:
+    def fmt_time(t):
+        ms = int((t % 1) * 1000)
+        s = int(t)
+        hh = s // 3600
+        mm = (s % 3600) // 60
+        ss = s % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d},{ms:03d}"
+
+    cur = 0.0
+    lines = []
+    idx = 1
+    for seg in audio_segments or []:
+        text = (seg.get("text") or "").strip()
+        ap = seg.get("audio_path")
+        dur = get_audio_duration(ap) if ap and os.path.exists(ap) else 0.0
+        if dur <= 0:
+            continue
+        chunks = _split_caption_chunks(text, max_chars=max_chars) or [text]
+
+        # Split one sentence duration into multiple one-line captions.
+        weights = [max(1, len(c)) for c in chunks]
+        total_w = sum(weights)
+        local_start = cur
+        for c, w in zip(chunks, weights):
+            local_dur = dur * (w / total_w)
+            local_end = local_start + local_dur
+            lines.append(str(idx))
+            lines.append(f"{fmt_time(local_start)} --> {fmt_time(local_end)}")
+            lines.append(c)
+            lines.append("")
+            idx += 1
+            local_start = local_end
+        cur += dur
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return out_path
+
 def render_video(
     scenes: List[dict],
     audio_path: str,
     overlay_png: Optional[str],
     out_path: str,
     layout_config: dict = None,
-    width=1080, height=1920
+    width=1920, height=1080
 ):
     """
     Stitches scenes together.
@@ -70,9 +144,17 @@ def render_video(
             "sub_y": 1460, "sub_margin_v": 100, "sub_font_size": 48
         }
 
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     total_dur = get_audio_duration(audio_path)
     srt_path = out_path.replace(".mp4", ".srt")
-    create_srt(scenes, total_dur, srt_path)
+    subtitle_segments = (layout_config or {}).get("subtitle_segments", [])
+    if subtitle_segments:
+        max_chars = int((layout_config or {}).get("subtitle_max_chars", 20))
+        create_srt_from_audio_segments(subtitle_segments, srt_path, max_chars=max_chars)
+        if not os.path.exists(srt_path) or os.path.getsize(srt_path) == 0:
+            create_srt(scenes, total_dur, srt_path)
+    else:
+        create_srt(scenes, total_dur, srt_path)
     
     # ... (rest of prep logic same as before until filter_complex) ...
     
@@ -81,7 +163,7 @@ def render_video(
     if total_chars == 0: total_chars = 1
     
     # Get Layout
-    news_x, news_y, news_w, news_h = layout_config.get("news_box", (0, 0, 1080, 1920)) if layout_config else (0, 0, 1080, 1920)
+    news_x, news_y, news_w, news_h = layout_config.get("news_box", (0, 0, width, height)) if layout_config else (0, 0, width, height)
 
     # 1. Process Scenes (Resize to News Box size)
     temp_files = []
@@ -113,10 +195,11 @@ def render_video(
              
         seg_cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", "-an", seg_out]
         
-        subprocess.run(seg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(seg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         temp_files.append(seg_out)
 
-    with open("out/concat_list.txt", "w") as f:
+    concat_list_path = os.path.join("out", "concat_list.txt")
+    with open(concat_list_path, "w", encoding="utf-8") as f:
         for tf in temp_files:
             f.write(f"file '{os.path.abspath(tf)}'\n")
             
@@ -127,13 +210,15 @@ def render_video(
     # 2: Fixed Character (Optional)
     # 3: Overlay Template (Optional)
     
-    input_args = ["-f", "concat", "-safe", "0", "-i", "out/concat_list.txt", "-i", audio_path]
+    input_args = ["-f", "concat", "-safe", "0", "-i", concat_list_path, "-i", audio_path]
+    audio_idx = 1
+    next_idx = 2
     
     # Filter Chain Construction
     filter_chain = []
     
-    # [bg] base 1080x1920
-    filter_chain.append(f"color=c=black:s=1080x1920[bg]")
+    # [bg] base canvas
+    filter_chain.append(f"color=c=black:s={width}x{height}[bg]")
     
     # Overlay News Stream [0:v] onto [bg]
     filter_chain.append(f"[bg][0:v]overlay={news_x}:{news_y}:shortest=1[v_canvas]")
@@ -141,41 +226,57 @@ def render_video(
     
     # 1. Fixed Character Layer
     fixed_char_path = layout_config.get("fixed_char_path") if layout_config else None
-    char_input_idx = -1
+    char_input_idx = None
     if fixed_char_path and os.path.exists(fixed_char_path):
+        char_input_idx = next_idx
+        next_idx += 1
         input_args += ["-i", fixed_char_path]
-        char_input_idx = len(input_args) // 2 - 1 
-        
-        # Scale Char to fit width (1080) and preserve aspect, align bottom
-        filter_chain.append(f"[{char_input_idx}:v]scale=1080:-1[v_char]") 
+
+        # Scale Char to fit canvas width and preserve aspect, align bottom
+        filter_chain.append(f"[{char_input_idx}:v]scale={width}:-1[v_char]") 
         filter_chain.append(f"{current_v}[v_char]overlay=(W-w)/2:H-h[v_w_char]")
         current_v = "[v_w_char]"
 
     # 2. Template Overlay Layer
-    ov_idx = -1
+    ov_idx = None
     if overlay_png:
+        ov_idx = next_idx
+        next_idx += 1
         input_args += ["-i", overlay_png]
-        ov_idx = len(input_args) // 2 - 1
         
     if overlay_png:
         filter_chain.append(f"{current_v}[{ov_idx}:v]overlay=0:0[v_ov]")
         current_v = "[v_ov]"
         
     # 3. Subtitles
-    srt_safe = srt_path.replace("\\", "/").replace(":", "\\:")
+    # FFmpeg subtitles filter can fail on some non-ASCII paths on Windows.
+    # Copy SRT to a temp ASCII-safe path and use that path in filter.
+    srt_filter_path = os.path.join(tempfile.gettempdir(), f"bean_subs_{os.getpid()}.srt")
+    with open(srt_path, "r", encoding="utf-8") as sf, open(srt_filter_path, "w", encoding="utf-8") as tf:
+        tf.write(sf.read())
+    srt_abs = os.path.abspath(srt_filter_path)
+    srt_safe = srt_abs.replace("\\", "/").replace(":", "\\:").replace("'", r"\'")
     margin_v = layout_config.get("sub_margin_v", 100) if layout_config else 100
     font_size = layout_config.get("sub_font_size", 48) if layout_config else 48
+    font_name = layout_config.get("subtitle_font_name", "Malgun Gothic") if layout_config else "Malgun Gothic"
+    subtitle_bold = int(layout_config.get("subtitle_bold", 1)) if layout_config else 1
     
-    # Use PrimaryColour for text (White), BackColour (Black outline/shadow)
-    style = f"FontName=Arial,FontSize={font_size},PrimaryColour=&H00FFFFFF,Outline=2,BackColour=&H80000000,BorderStyle=3,MarginV={margin_v},Alignment=2"
-    filter_chain.append(f"{current_v}subtitles='{srt_safe}':force_style='{style}'[v_final]")
+    # Thumbnail-like subtitle style: no black box plate, strong outline only.
+    style = (
+        f"FontName={font_name},Bold={subtitle_bold},FontSize={font_size},"
+        f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=3,Shadow=0,"
+        f"BorderStyle=1,MarginV={margin_v},Alignment=2"
+    )
+    filter_chain.append(f"{current_v}subtitles='{srt_safe}':charenc=UTF-8:force_style='{style}'[v_final]")
     
     # Construct final command
     stitch_cmd = [FFMPEG_BIN, "-y"] + input_args
     stitch_cmd += ["-filter_complex", ";".join(filter_chain)]
-    stitch_cmd += ["-map", "[v_final]", "-map", "1:a"]
+    stitch_cmd += ["-map", "[v_final]", "-map", f"{audio_idx}:a"]
     stitch_cmd += ["-c:v", "libx264", "-c:a", "aac", "-shortest", out_path]
     
     print(f"Running FFmpeg: {' '.join(stitch_cmd)}")
-    subprocess.run(stitch_cmd, check=True)
+    p = subprocess.run(stitch_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed ({p.returncode})\n{p.stderr}")
     return out_path

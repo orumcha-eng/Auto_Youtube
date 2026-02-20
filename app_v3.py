@@ -5,10 +5,15 @@ import streamlit as st
 import os
 import json
 import time
+import re
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
 from src.visual_gen import VisualGenerator
 from PIL import Image, ImageDraw, ImageFont
+import imageio_ffmpeg
+from src.audio import AudioGenerator
+from src.media_processor import render_video
 
 # ---- CONFIG & SETUP ----
 st.set_page_config(layout="wide", page_title="Auto Youtube V3 (Bean World)")
@@ -47,6 +52,7 @@ if "v3_data" not in st.session_state:
         "selected_thumbnail_copy": "",
         "script_data": None,    # {full_text, segments: [{title, body}]}
         "scenes": [],           # List of scene dicts
+        "audio_segments": [],
         "audio_path": None,
         "video_path": None
     }
@@ -54,12 +60,79 @@ if "v3_data" not in st.session_state:
 def next_step(): st.session_state.v3_data["step"] += 1
 def prev_step(): st.session_state.v3_data["step"] -= 1
 
+
+def jump_to_step(step_num: int):
+    st.session_state.v3_data["step"] = step_num
+    st.rerun()
+
+
+def split_script_sentences(text: str) -> list:
+    src = (text or "").strip()
+    if not src:
+        return []
+    src = re.sub(r"\s+", " ", src)
+    parts = re.split(r"(?<=[\.\!\?])\s+|(?<=다\.)\s+|(?<=요\.)\s+", src)
+    out = [p.strip() for p in parts if p and len(p.strip()) > 2]
+    return out
+
+
+def merge_mp3_files(input_files: list, out_path: str) -> str:
+    files = [f for f in input_files if f and os.path.exists(f)]
+    if not files:
+        return ""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    list_path = os.path.join(OUT_DIR, f"concat_{int(time.time())}.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in files:
+            f.write(f"file '{os.path.abspath(p).replace('\\\\', '/')}'\n")
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_path,
+        "-ar", "44100", "-ac", "2",
+        "-b:a", "192k",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out_path
+
 # ---- UI: SIDEBAR ----
 st.sidebar.title("Bean World Studio")
 api_key = st.sidebar.text_input("Gemini API Key", value=os.getenv("GOOGLE_API_KEY", ""), type="password")
 st.session_state["luma_key_input"] = st.sidebar.text_input("Luma API Key (Optional for Real Video)", value=os.getenv("LUMA_API_KEY", ""), type="password")
 
+# Sidebar bookmark navigation
+st.sidebar.markdown("---")
+st.sidebar.subheader("Bookmarks")
+current_step = st.session_state.v3_data["step"]
+st.sidebar.caption(f"Current Step: {current_step}")
+if st.sidebar.button("Step 1: Thumbnail", use_container_width=True, type=("primary" if current_step == 1 else "secondary")):
+    jump_to_step(1)
+if st.sidebar.button("Step 2: Script", use_container_width=True, type=("primary" if current_step == 2 else "secondary")):
+    jump_to_step(2)
+if st.sidebar.button("Step 3: Storyboard", use_container_width=True, type=("primary" if current_step == 3 else "secondary")):
+    jump_to_step(3)
+if st.sidebar.button("Step 4: Audio", use_container_width=True, type=("primary" if current_step == 4 else "secondary")):
+    jump_to_step(4)
+if st.sidebar.button("Step 5: Render", use_container_width=True, type=("primary" if current_step == 5 else "secondary")):
+    jump_to_step(5)
+
 from src.content import ContentModule
+
+# Top bookmark bar
+top_nav = st.columns(5)
+if top_nav[0].button("1. Thumbnail", use_container_width=True, type=("primary" if current_step == 1 else "secondary")):
+    jump_to_step(1)
+if top_nav[1].button("2. Script", use_container_width=True, type=("primary" if current_step == 2 else "secondary")):
+    jump_to_step(2)
+if top_nav[2].button("3. Storyboard", use_container_width=True, type=("primary" if current_step == 3 else "secondary")):
+    jump_to_step(3)
+if top_nav[3].button("4. Audio", use_container_width=True, type=("primary" if current_step == 4 else "secondary")):
+    jump_to_step(4)
+if top_nav[4].button("5. Render", use_container_width=True, type=("primary" if current_step == 5 else "secondary")):
+    jump_to_step(5)
+st.caption(f"Bookmark Navigation | Current Step: {st.session_state.v3_data['step']}")
 
 # ---- STEP 1: TOPIC & THUMBNAIL ----
 def step_thumbnail():
@@ -593,8 +666,231 @@ def step_storyboard():
             st.rerun()
     with c2:
         all_ready = st.session_state.v3_data["scenes"] and all(s.get("image_path") for s in st.session_state.v3_data["scenes"])
-        if st.button("Go to Render (Step 4)" if all_ready else "Go to Render (Skip missing images)"):
+        if st.button("Go to Audio (Step 4)" if all_ready else "Go to Audio (Skip missing images)"):
             next_step()
+            st.rerun()
+
+
+# ---- STEP 4: AUDIO (SENTENCE TTS) ----
+def step_audio():
+    st.header("Step 4: Audio (Sentence TTS)")
+
+    script_data = st.session_state.v3_data.get("script_data") or {}
+    full_text = (script_data.get("full_text") or "").strip()
+    if not full_text:
+        st.warning("No script found. Go back to Step 2 first.")
+        if st.button("Back to Script"):
+            st.session_state.v3_data["step"] = 2
+            st.rerun()
+        return
+
+    provider_label = st.selectbox(
+        "TTS Provider",
+        ["AI Studio (Gemini TTS)", "Google Cloud TTS"],
+        index=0,
+        help="AI Studio uses Gemini TTS voice set. Cloud uses ko-KR-Neural2/Studio voices."
+    )
+    tts_provider = "aistudio" if provider_label.startswith("AI Studio") else "cloud"
+    ag = AudioGenerator(api_key=api_key, provider=tts_provider)
+    recommended_voice = "Kore" if tts_provider == "aistudio" else "ko-KR-Neural2-C"
+
+    voice_cache_key = f"voice_list_{tts_provider}"
+    if voice_cache_key not in st.session_state.v3_data:
+        st.session_state.v3_data[voice_cache_key] = []
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if st.button("Load Voices"):
+            voices = ag.list_voices(lang="ko-KR")
+            st.session_state.v3_data[voice_cache_key] = voices
+            st.success(f"Loaded {len(voices)} voices")
+    with c2:
+        speed = st.slider("Speed", 0.85, 1.20, 1.00, 0.01)
+
+    voices = st.session_state.v3_data.get(voice_cache_key) or []
+    if voices:
+        default_idx = 0
+        if recommended_voice in voices:
+            default_idx = voices.index(recommended_voice)
+        elif tts_provider == "cloud":
+            for i, v in enumerate(voices):
+                if "Neural2" in v:
+                    default_idx = i
+                    break
+        voice_name = st.selectbox("Voice", voices, index=default_idx)
+    else:
+        default_voice = recommended_voice
+        voice_name = st.text_input("Voice", value=default_voice)
+    st.caption(f"Recommended default for this channel: {recommended_voice}")
+
+    if st.button("Prepare Sentence Segments"):
+        sents = split_script_sentences(full_text)
+        segs = []
+        for i, s in enumerate(sents):
+            segs.append({
+                "idx": i,
+                "text": s,
+                "audio_path": None,
+            })
+        st.session_state.v3_data["audio_segments"] = segs
+        st.success(f"Prepared {len(segs)} sentence segments.")
+
+    segs = st.session_state.v3_data.get("audio_segments") or []
+    if segs:
+        if st.button("Generate ALL Missing Sentence Audio", type="primary"):
+            pb = st.progress(0)
+            done = 0
+            for i, seg in enumerate(segs):
+                if seg.get("audio_path") and os.path.exists(seg["audio_path"]):
+                    done += 1
+                    pb.progress(done / len(segs))
+                    continue
+                out_p = os.path.join(OUT_DIR, f"tts_seg_{i:04d}_{int(time.time())}.mp3")
+                res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
+                if res and os.path.exists(res):
+                    seg["audio_path"] = res
+                done += 1
+                pb.progress(done / len(segs))
+            st.success("Sentence TTS generation done.")
+
+        st.caption(f"Segments: {len(segs)}")
+        for seg in segs[:40]:
+            with st.expander(f"Seg {seg['idx']+1}: {seg['text'][:60]}..."):
+                st.write(seg["text"])
+                if st.button(f"Generate Seg {seg['idx']+1}", key=f"gen_seg_{seg['idx']}"):
+                    out_p = os.path.join(OUT_DIR, f"tts_seg_{seg['idx']:04d}_{int(time.time())}.mp3")
+                    res = ag.generate(seg["text"], voice_name, out_p, speed=speed)
+                    if res and os.path.exists(res):
+                        seg["audio_path"] = res
+                        st.rerun()
+                if seg.get("audio_path") and os.path.exists(seg["audio_path"]):
+                    st.audio(seg["audio_path"])
+
+        if len(segs) > 40:
+            st.caption(f"... {len(segs)-40} more segments not expanded")
+
+        if st.button("Merge Sentence Audio to Final MP3"):
+            paths = [s.get("audio_path") for s in segs]
+            if not all(p and os.path.exists(p) for p in paths):
+                st.error("Some segments are missing audio. Generate all first.")
+            else:
+                out_mp3 = os.path.join(OUT_DIR, f"audio_final_{int(time.time())}.mp3")
+                try:
+                    merged = merge_mp3_files(paths, out_mp3)
+                    st.session_state.v3_data["audio_path"] = merged
+                    st.success(f"Merged audio: {merged}")
+                except Exception as e:
+                    st.error(f"Audio merge failed: {e}")
+
+    if st.session_state.v3_data.get("audio_path") and os.path.exists(st.session_state.v3_data["audio_path"]):
+        st.subheader("Final Audio")
+        st.audio(st.session_state.v3_data["audio_path"])
+
+    st.markdown("---")
+    n1, n2 = st.columns(2)
+    with n1:
+        if st.button("Back to Storyboard"):
+            prev_step()
+            st.rerun()
+    with n2:
+        if st.button("Go to Render (Step 5)"):
+            next_step()
+            st.rerun()
+
+
+# ---- STEP 5: RENDER ----
+def step_render():
+    st.header("Step 5: Final Render")
+    scenes = st.session_state.v3_data.get("scenes") or []
+    audio_path = st.session_state.v3_data.get("audio_path")
+
+    if not scenes:
+        st.warning("No scenes found. Go back to Step 3.")
+        if st.button("Back to Storyboard"):
+            st.session_state.v3_data["step"] = 3
+            st.rerun()
+        return
+    if not audio_path or not os.path.exists(audio_path):
+        st.warning("No merged audio found. Go back to Step 4.")
+        if st.button("Back to Audio"):
+            st.session_state.v3_data["step"] = 4
+            st.rerun()
+        return
+
+    # Longform mode: do not use old frame template layers.
+    overlay_png = None
+    fixed_char = None
+
+    default_out = os.path.join(OUT_DIR, f"final_longform_{int(time.time())}.mp4")
+    out_path = st.text_input("Output Path", value=default_out)
+    # Longform 16:9 full-frame defaults
+    news_box = (0, 0, 1920, 1080)
+    sub_margin_v = 60
+    sub_font_size = 34
+    st.caption("Longform mode (16:9): no template frame / no overlay / no fixed character")
+
+    # Ensure media path fallback per scene.
+    render_scenes = []
+    for s in scenes:
+        s2 = dict(s)
+        s2["generated_media_path"] = s2.get("generated_media_path") or s2.get("video_path") or s2.get("image_path")
+        if not s2.get("generated_media_path") or not os.path.exists(s2["generated_media_path"]):
+            # Skip impossible scenes at render-time with a warning.
+            continue
+        render_scenes.append(s2)
+
+    st.caption(f"Renderable scenes: {len(render_scenes)} / {len(scenes)}")
+
+    if st.button("Render Final Video", type="primary"):
+        if not render_scenes:
+            st.error("No renderable scenes. Generate scene media first.")
+        else:
+            try:
+                with st.spinner("Rendering final video... this can take several minutes."):
+                    layout = {
+                        "news_box": news_box,
+                        "fixed_char_path": fixed_char,
+                        "sub_margin_v": sub_margin_v,
+                        "sub_font_size": sub_font_size,
+                        "subtitle_font_name": "Malgun Gothic Bold",
+                        "subtitle_bold": 1,
+                        "subtitle_max_chars": 20,
+                        "subtitle_segments": st.session_state.v3_data.get("audio_segments", []),
+                    }
+                    final_path = render_video(
+                        scenes=render_scenes,
+                        audio_path=audio_path,
+                        overlay_png=overlay_png,
+                        out_path=out_path,
+                        layout_config=layout,
+                        width=1920,
+                        height=1080,
+                    )
+                    st.session_state.v3_data["video_path"] = final_path
+                    st.success(f"Render complete: {final_path}")
+            except Exception as e:
+                st.error(f"Render failed: {e}")
+
+    final_video = st.session_state.v3_data.get("video_path")
+    if final_video and os.path.exists(final_video):
+        st.video(final_video)
+        with open(final_video, "rb") as f:
+            st.download_button(
+                "Download Final Video",
+                data=f,
+                file_name=os.path.basename(final_video),
+                mime="video/mp4",
+            )
+
+    st.markdown("---")
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Back to Audio"):
+            prev_step()
+            st.rerun()
+    with b2:
+        if st.button("Restart"):
+            st.session_state.v3_data["step"] = 1
             st.rerun()
 
 # ---- MAIN ROUTER ----
@@ -606,8 +902,12 @@ elif step == 2:
     step_script()
 elif step == 3:
     step_storyboard()
+elif step == 4:
+    step_audio()
+elif step == 5:
+    step_render()
 else:
-    st.write("Render Page Placeholder")
+    st.write("Unknown step.")
     if st.button("Restart"):
         st.session_state.v3_data["step"] = 1
 

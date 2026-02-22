@@ -10,6 +10,18 @@ import imageio_ffmpeg
 from mutagen.mp3 import MP3
 
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".ts", ".m2ts", ".wmv"}
+
+
+def _looks_like_video(media_path: str, media_type_hint: str = "") -> bool:
+    """
+    Prefer actual file extension over stale media_type metadata.
+    This prevents still images from being treated as video (which skips zoom motion).
+    """
+    ext = os.path.splitext((media_path or "").lower())[1]
+    if ext:
+        return ext in VIDEO_EXTS
+    return (media_type_hint or "").lower() == "video"
 
 def get_audio_duration(path: str) -> float:
     try:
@@ -214,6 +226,12 @@ def render_video(
                 pass
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # Remove stale target file to avoid confusing old/partial outputs.
+    if os.path.exists(out_path):
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
     _progress(0.02, "Preparing render...")
     total_dur = get_audio_duration(audio_path)
     srt_path = out_path.replace(".mp4", ".srt")
@@ -249,18 +267,31 @@ def render_video(
     scene_durations = _compute_scene_durations_from_audio_segments(scenes, subtitle_segments, total_dur)
     for i, s in enumerate(scenes):
         txt_len = len(s["text"])
-        dur = scene_durations[i] if len(scene_durations) == len(scenes) else (total_dur * (txt_len / total_chars))
+        forced_dur = 0.0
+        try:
+            forced_dur = float(s.get("_segment_duration") or 0.0)
+        except Exception:
+            forced_dur = 0.0
+        if forced_dur <= 0.0:
+            ap = s.get("_segment_audio_path")
+            if ap and os.path.exists(ap):
+                forced_dur = get_audio_duration(ap)
+
+        if forced_dur > 0:
+            dur = forced_dur
+        else:
+            dur = scene_durations[i] if len(scene_durations) == len(scenes) else (total_dur * (txt_len / total_chars))
         dur = max(0.25, float(dur))
         media_file = (
-            s.get("generated_media_path")
-            or s.get("video_path")
+            s.get("video_path")
+            or s.get("generated_media_path")
             or s.get("image_path")
         )
         
         if not media_file: 
              media_file = "assets/placeholder.jpg" 
              
-        is_video = s.get("media_type") == "video"
+        is_video = _looks_like_video(media_file, s.get("media_type"))
         seg_out = f"out/temp_seg_{i:03d}.mp4"
         
         seg_cmd = [FFMPEG_BIN, "-y"]
@@ -402,5 +433,7 @@ def render_video(
     rc = proc.wait()
     if rc != 0:
         raise RuntimeError(f"ffmpeg failed ({rc})\n{''.join(err_lines)}")
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 1024:
+        raise RuntimeError("ffmpeg finished but output video file is missing or empty.")
     _progress(1.0, "Render complete.")
     return out_path

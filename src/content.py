@@ -13,6 +13,7 @@ import feedparser
 from dateutil import parser as dtparser
 from icalendar import Calendar
 import json
+import time
 from google.auth.exceptions import DefaultCredentialsError
 import google.generativeai as genai
 from google import genai as genai_new
@@ -31,6 +32,9 @@ INVESTING_RSS_URLS = [
     "https://www.investing.com/rss/stock_market.rss",     # Stock Market
     "https://www.investing.com/rss/economy_indicators.rss" # Indicators
 ]
+INVESTING_CONNECT_TIMEOUT_SEC = 8
+INVESTING_READ_TIMEOUT_SEC = 20
+INVESTING_RETRY_COUNT = 3
 
 FED_CAL_URL_TMPL = "https://www.federalreserve.gov/newsevents/{year}-{monthname}.htm"
 BEA_ICS_URL = "https://www.bea.gov/news/schedule/ics/online-calendar-subscription.ics"
@@ -282,33 +286,50 @@ def fetch_investing_rss() -> List[Headline]:
     """Fetch from Investing.com RSS feeds"""
     all_headlines = []
     headers = {"User-Agent": UA}
+
+    def fetch_with_retry(url: str) -> Optional[bytes]:
+        for attempt in range(1, INVESTING_RETRY_COUNT + 1):
+            try:
+                resp = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=(INVESTING_CONNECT_TIMEOUT_SEC, INVESTING_READ_TIMEOUT_SEC),
+                )
+                resp.raise_for_status()
+                return resp.content
+            except requests.exceptions.RequestException as e:
+                if attempt == INVESTING_RETRY_COUNT:
+                    print(f"Error fetching {url} after {attempt} attempts: {e}")
+                    return None
+                time.sleep(0.7 * attempt)
+        return None
     
     for url in INVESTING_RSS_URLS:
-        try:
-            resp = requests.get(url, headers=headers, timeout=5)
-            feed = feedparser.parse(resp.content)
-            for entry in feed.entries[:10]: # Top 10 from each
-                # Filter out old? For now just take latest
-                t = ihtml.unescape(entry.title)
-                l = entry.link
-                s = "Investing.com"
-                
-                # Check duplication
-                if any(h.title == t for h in all_headlines): continue
-                
-                dt_obj = datetime.now() # Fallback
-                if hasattr(entry, "published_parsed") and entry.published_parsed:
-                     dt_obj = datetime(*entry.published_parsed[:6])
-                
-                all_headlines.append(Headline(
-                    title=t,
-                    source=s,
-                    link=l,
-                    published_at=dt_obj,
-                    score=5 # High score for specific source
-                ))
-        except Exception as e:
-            print(f"Error fetching {url}: {e}")
+        content = fetch_with_retry(url)
+        if not content:
+            continue
+
+        feed = feedparser.parse(content)
+        for entry in feed.entries[:10]: # Top 10 from each
+            # Filter out old? For now just take latest
+            t = ihtml.unescape(entry.title)
+            l = entry.link
+            s = "Investing.com"
+            
+            # Check duplication
+            if any(h.title == t for h in all_headlines): continue
+            
+            dt_obj = datetime.now() # Fallback
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    dt_obj = datetime(*entry.published_parsed[:6])
+            
+            all_headlines.append(Headline(
+                title=t,
+                source=s,
+                link=l,
+                published_at=dt_obj,
+                score=5 # High score for specific source
+            ))
             
     return all_headlines
 
@@ -517,8 +538,8 @@ Output JSON only:
         model = genai.GenerativeModel("gemini-2.0-flash")
 
         data_json = json.dumps(curated_data, indent=2, ensure_ascii=False)
-        min_words = max(600, int(duration_min * 115))
-        target_words = int(duration_min * 135)
+        min_words = max(600, int(duration_min * 105))
+        target_words = int(duration_min * 125)
 
         def _enforce_host_name(text: str, host_name: str = "콩이") -> str:
             s = text or ""

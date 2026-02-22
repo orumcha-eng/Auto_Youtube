@@ -8,8 +8,10 @@ import tempfile
 import re
 import wave
 import time
+import json
 from google.cloud import texttospeech
 from google.oauth2 import service_account
+from google.auth.exceptions import DefaultCredentialsError
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
@@ -61,7 +63,14 @@ class AudioGenerator:
         self.provider = (provider or "auto").lower()
         self.cloud_client = None
         self.ai_client = None
-        self.ai_tts_model = "models/gemini-2.5-flash-preview-tts"
+        self.ai_tts_model = (os.getenv("AI_TTS_MODEL", "") or "models/gemini-2.5-flash-preview-tts").strip()
+        self.ai_tts_model_candidates = [
+            self.ai_tts_model,
+            "models/gemini-2.5-flash-preview-tts",
+            "models/gemini-2.5-flash-tts",
+            "models/gemini-2.5-pro-tts",
+        ]
+        self.ai_tts_model_candidates = list(dict.fromkeys([m for m in self.ai_tts_model_candidates if m]))
         self.ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         self.last_provider_used = self.provider
         self.last_error = ""
@@ -99,17 +108,76 @@ class AudioGenerator:
                 nxt += 1
         return False
 
+    def _rotate_aistudio_model(self, reason_msg: str = "") -> bool:
+        if self.provider != "aistudio":
+            return False
+        if not self.ai_tts_model_candidates:
+            return False
+        try:
+            cur_idx = self.ai_tts_model_candidates.index(self.ai_tts_model)
+        except ValueError:
+            cur_idx = -1
+        for nxt in range(cur_idx + 1, len(self.ai_tts_model_candidates)):
+            cand = self.ai_tts_model_candidates[nxt]
+            if cand == self.ai_tts_model:
+                continue
+            self.ai_tts_model = cand
+            print(f"AI Studio TTS model rotated to {cand} due to: {reason_msg[:120]}")
+            return True
+        return False
+
     def _init_cloud_client(self):
-        key_path = "gcp-tts-key.json"
-        if os.path.exists(key_path):
-            creds = service_account.Credentials.from_service_account_file(key_path)
-            return texttospeech.TextToSpeechClient(credentials=creds)
-        return texttospeech.TextToSpeechClient()
+        try:
+            env_key = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "") or "").strip()
+            if env_key and os.path.exists(env_key):
+                creds = service_account.Credentials.from_service_account_file(env_key)
+                return texttospeech.TextToSpeechClient(credentials=creds)
+
+            key_candidates = []
+            fixed_key = "gcp-tts-key.json"
+            if os.path.exists(fixed_key):
+                key_candidates.append(fixed_key)
+
+            for fn in os.listdir("."):
+                if not fn.lower().endswith(".json"):
+                    continue
+                if fn in key_candidates:
+                    continue
+                try:
+                    with open(fn, "r", encoding="utf-8") as f:
+                        obj = json.load(f)
+                    if obj.get("type") == "service_account" and obj.get("private_key"):
+                        key_candidates.append(fn)
+                except Exception:
+                    continue
+
+            if key_candidates:
+                creds = service_account.Credentials.from_service_account_file(key_candidates[0])
+                print(f"Cloud TTS using service account key: {key_candidates[0]}")
+                return texttospeech.TextToSpeechClient(credentials=creds)
+
+            return texttospeech.TextToSpeechClient()
+        except DefaultCredentialsError as e:
+            self.last_error = (
+                "Google Cloud TTS credentials not found. "
+                "Set GOOGLE_APPLICATION_CREDENTIALS or place a service-account JSON in project root."
+            )
+            print(f"Cloud TTS init failed (missing credentials): {e}")
+            return None
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"Cloud TTS init failed: {e}")
+            return None
 
     def list_voices(self, lang="ko-KR") -> list:
         if self.provider == "aistudio":
             self.voice_gender_map = dict(self.AI_STUDIO_VOICE_GENDER)
             return self.AI_STUDIO_VOICES
+
+        if self.cloud_client is None:
+            if not self.last_error:
+                self.last_error = "Cloud TTS client unavailable."
+            return ["ko-KR-Neural2-C", "ko-KR-Neural2-A"] # Fallback
 
         try:
             resp = self.cloud_client.list_voices(language_code=lang)
@@ -189,6 +257,14 @@ class AudioGenerator:
         return r
 
     def _generate_cloud(self, text: str, voice_name: str, out_path: str, speed: float = 1.0) -> str:
+        if self.cloud_client is None:
+            if not self.last_error:
+                self.last_error = (
+                    "Cloud TTS client unavailable. "
+                    "Set GOOGLE_APPLICATION_CREDENTIALS or gcp-tts-key.json."
+                )
+            return None
+
         # Input
         s_input = texttospeech.SynthesisInput(text=text)
         
@@ -369,8 +445,11 @@ class AudioGenerator:
                     msg = str(e)
                     print(f"AI Studio TTS Failed: {msg}")
                     last_msg = msg
+                    ml = msg.lower()
+                    if "not_found" in ml or "is not found for api version" in ml or "not supported for generatecontent" in ml:
+                        if self._rotate_aistudio_model(msg):
+                            continue
                     if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                        ml = msg.lower()
                         is_daily_quota = (
                             "per_day" in ml
                             or "per model per day" in ml

@@ -31,6 +31,17 @@ class VisualGenerator:
         self.model_name = "gemini-2.0-flash"
         self.last_key_used = f"k{self.api_key_idx+1}"
 
+    def _normalize_thumbnail_16x9(self, image_path: str, width: int = 1280, height: int = 720) -> bool:
+        try:
+            from PIL import Image, ImageOps
+            img = Image.open(image_path).convert("RGB")
+            fitted = ImageOps.fit(img, (width, height), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+            fitted.save(image_path, quality=95)
+            return True
+        except Exception as e:
+            print(f"Thumbnail normalize failed: {e}")
+            return False
+
     def _rotate_api_key(self, reason_msg: str = "") -> bool:
         if len(self.api_keys) <= 1:
             return False
@@ -409,6 +420,7 @@ class VisualGenerator:
                             if inline and getattr(inline, "data", None):
                                 with open(out_path, "wb") as f:
                                     f.write(inline.data)
+                                self._normalize_thumbnail_16x9(out_path)
                                 self.last_key_used = f"k{self.api_key_idx+1}"
                                 return out_path
                         break
@@ -440,6 +452,7 @@ class VisualGenerator:
                         if response.generated_images:
                             image = response.generated_images[0].image
                             image.save(out_path)
+                            self._normalize_thumbnail_16x9(out_path)
                             self.last_key_used = f"k{self.api_key_idx+1}"
                             return out_path
                         break
@@ -465,13 +478,14 @@ class VisualGenerator:
         short_prompt = re.sub(r"\s+", " ", prompt).strip()[:280]
         safe_prompt = re.sub(r"[^a-zA-Z0-9, ]", "", short_prompt) or "bean character market thumbnail"
         url = "https://image.pollinations.ai/prompt/" + requests.utils.quote(safe_prompt)
-        params = {"width": 1080, "height": 1920, "nologo": "true"}
+        params = {"width": 1280, "height": 720, "nologo": "true"}
         
         try:
             resp = requests.get(url, params=params, timeout=30)
             resp.raise_for_status()
             img = Image.open(BytesIO(resp.content))
             img.save(out_path)
+            self._normalize_thumbnail_16x9(out_path)
             return out_path
         except Exception as e:
             print(f"Pollinations Gen failed: {e}")

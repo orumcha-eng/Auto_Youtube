@@ -1364,19 +1364,29 @@ def step_audio():
                 out_mp3 = os.path.join(OUT_DIR, f"audio_final_{int(time.time())}.mp3")
                 try:
                     merged = merge_mp3_files(paths, out_mp3)
+                    merged_d = get_audio_duration(merged)
+                    if effective_target_min > 0 and merged_d < (effective_target_min * 60 * 0.85):
+                        st.error(
+                            f"Merged audio is too short ({merged_d/60:.2f} min) for target "
+                            f"{effective_target_min} min. Regenerate script/TTS before render."
+                        )
                     st.session_state.v3_data["audio_path"] = merged
                     st.success(f"Merged audio: {merged}")
                 except Exception as e:
                     st.error(f"Audio merge failed: {e}")
 
+    script_wc = len((script_data.get("full_text") or "").split())
+    est_script_min = (script_wc / 130.0) if script_wc > 0 else 0.0
+    cfg_target_min = int(st.session_state.v3_data.get("target_duration_min") or 0)
+    effective_target_min = cfg_target_min if cfg_target_min > 0 else int(round(est_script_min))
+
     if st.session_state.v3_data.get("audio_path") and os.path.exists(st.session_state.v3_data["audio_path"]):
         st.subheader("Final Audio")
         st.audio(st.session_state.v3_data["audio_path"])
         aud_d = get_audio_duration(st.session_state.v3_data["audio_path"])
-        tgt = int(st.session_state.v3_data.get("target_duration_min") or 0)
-        if tgt > 0:
-            st.caption(f"Merged audio length: {aud_d/60:.2f} min (target: {tgt} min)")
-            if aud_d < (tgt * 60 * 0.85):
+        if effective_target_min > 0:
+            st.caption(f"Merged audio length: {aud_d/60:.2f} min (target: {effective_target_min} min)")
+            if aud_d < (effective_target_min * 60 * 0.85):
                 st.warning(
                     "Merged audio is much shorter than target duration. "
                     "Please regenerate/expand script or fill missing TTS before rendering."
@@ -1412,7 +1422,12 @@ def step_render():
             st.session_state.v3_data["step"] = 4
             st.rerun()
         return
+    script_data = st.session_state.v3_data.get("script_data") or {}
+    script_wc = len((script_data.get("full_text") or "").split())
+    est_script_min = (script_wc / 130.0) if script_wc > 0 else 0.0
     target_min = int(st.session_state.v3_data.get("target_duration_min") or 0)
+    if target_min <= 0 and est_script_min > 0:
+        target_min = int(round(est_script_min))
     audio_dur = get_audio_duration(audio_path)
     if target_min > 0:
         st.caption(f"Audio length: {audio_dur/60:.2f} min (target: {target_min} min)")
